@@ -1,0 +1,8 @@
+[package]
+name = "cs2-provider"
+version = "0.1.0"
+edition = "2021"
+description = "Trait for CS2 match discovery backends"
+
+[dependencies]
+cs2-sharecode = { path = "../cs2-sharecode" }

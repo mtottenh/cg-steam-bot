@@ -1,0 +1,56 @@
+name: build-deb
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag, or SHA)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # create/upload the release
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      # The deb (portal-steam-bot) ships two release binaries — build both,
+      # then package without rebuilding. Mirrors the documented deploy command.
+      - name: Build release binaries
+        run: cargo build --release --locked -p cs2-poller -p cs2-enricher
+
+      - name: Build deb
+        run: cargo deb -p cs2-enricher --no-build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portal-steam-bot-deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+      # Creates the release if it doesn't exist yet (a tag push is usually the
+      # first time we see vX.Y.Z) then attaches the deb. Plain `gh release
+      # upload <tag>` fails when the release doesn't already exist.
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/debian/*.deb
+          fail_on_unmatched_files: true

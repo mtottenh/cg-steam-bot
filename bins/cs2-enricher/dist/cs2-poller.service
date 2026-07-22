@@ -1,0 +1,50 @@
+[Unit]
+Description=Gaming Portal CS2 share-code poller (Steam Web API)
+Documentation=https://github.com/community-gaming/gaming-portal
+After=network-online.target portal-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=portal
+Group=portal
+WorkingDirectory=/var/lib/portal
+EnvironmentFile=/etc/portal/cs2-poller.env
+
+ExecStart=/usr/bin/cs2-poller
+
+Restart=on-failure
+RestartSec=15s
+StartLimitIntervalSec=300s
+StartLimitBurst=5
+
+TimeoutStopSec=30s
+
+LimitNOFILE=8192
+MemoryMax=256M
+TasksMax=128
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cs2-poller
+
+[Install]
+WantedBy=multi-user.target

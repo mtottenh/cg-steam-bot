@@ -1,0 +1,16 @@
+[package]
+name = "cs2-demo-rank"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal CS2 demo parser — extracts rank update messages only"
+
+[dependencies]
+snap = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+parallel_bzip2_decoder = "0.2"
+parser = { path = "../../vendor/parser" }
+ahash = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

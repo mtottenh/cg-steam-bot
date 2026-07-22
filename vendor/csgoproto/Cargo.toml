@@ -1,0 +1,20 @@
+[package]
+name = "csgoproto"
+version = "0.1.5"
+authors = ["Laiho"]
+edition = "2021"
+
+[lib]
+crate-type = ["lib"]
+
+# Vendored from LaihoE/demoparser @ edc8b46 (tag v0.41.1), then made hermetic:
+# upstream's build.rs cloned SteamDatabase/GameTracking-CS2 at build time and
+# prost-generated src/protobuf.rs into the source tree. We commit the generated
+# protobuf.rs / maps.rs / message_type.rs (referenced as modules in src/lib.rs)
+# and drop the codegen, so builds are offline, deterministic and network-free.
+# To regenerate on a deliberate bump see vendor/REGENERATING.md.
+[dependencies]
+prost = "0.13.3"
+phf = { version = "0.11", features = ["macros"] }
+strum = { version = "0.26", features = ["derive"] }
+winnow = { version = "0.7.2", features = ["simd"] }

@@ -1,0 +1,16 @@
+[package]
+name = "demo-downloader"
+version = "0.1.0"
+edition = "2021"
+description = "Dev tool — downloads recent CS2 demos for a player via the Portal API"
+
+[dependencies]
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+parallel_bzip2_decoder.workspace = true
+rayon.workspace = true

@@ -1,0 +1,61 @@
+[Unit]
+Description=Gaming Portal CS2 match enricher (Game Coordinator)
+Documentation=https://github.com/community-gaming/gaming-portal
+After=network-online.target portal-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=portal
+Group=portal
+WorkingDirectory=/var/lib/portal
+EnvironmentFile=/etc/portal/cs2-enricher.env
+
+# steam-vent persists Steam Guard session data via FileGuardDataStore
+# (XDG cache dir). CacheDirectory gives the service a private, writable
+# /var/cache/portal-steam-bot even under ProtectSystem=strict, and
+# XDG_CACHE_HOME points the guard store at it. HOME is set because some
+# steam-vent paths fall back to $HOME.
+CacheDirectory=portal-steam-bot
+Environment=XDG_CACHE_HOME=/var/cache/portal-steam-bot
+Environment=HOME=/var/lib/portal
+
+ExecStart=/usr/bin/cs2-enricher
+
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=600s
+StartLimitBurst=5
+
+TimeoutStopSec=30s
+
+# Enrichment downloads and bzip2-decompresses demos (rayon), so it needs
+# more headroom than the poller.
+LimitNOFILE=16384
+MemoryMax=1536M
+TasksMax=256
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cs2-enricher
+
+[Install]
+WantedBy=multi-user.target

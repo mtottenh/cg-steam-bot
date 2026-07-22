@@ -1,0 +1,16 @@
+[package]
+name = "cs2-webapi"
+version = "0.1.0"
+edition = "2021"
+description = "CS2 Steam Web API client for match share code discovery"
+
+[dependencies]
+cs2-sharecode = { path = "../cs2-sharecode" }
+cs2-provider = { path = "../cs2-provider" }
+governor.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true

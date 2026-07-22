@@ -1,0 +1,68 @@
+[package]
+name = "cs2-enricher"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "CS2 match enricher bot — fetches full match data from the Game Coordinator"
+
+[dependencies]
+cs2-gc = { path = "../../crates/cs2-gc" }
+cs2-sharecode = { path = "../../crates/cs2-sharecode" }
+cs2-demo-rank = { path = "../../crates/cs2-demo-rank" }
+steam-vent.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+clap.workspace = true
+rpassword.workspace = true
+parallel_bzip2_decoder.workspace = true
+rayon.workspace = true
+
+# ---------------------------------------------------------------------------
+# Debian package `portal-steam-bot` — ships BOTH long-running services
+# (cs2-poller + cs2-enricher). cargo-deb resolves asset source paths
+# relative to THIS crate's dir (bins/cs2-enricher/), hence dist/ lives here;
+# target/release/ is special-cased to the workspace target dir. Build:
+#
+#   cargo build --release -p cs2-poller -p cs2-enricher
+#   cargo deb -p cs2-enricher --no-build
+#
+# The dev-only bins (cs2-matches, demo-downloader, steam-totp) are NOT
+# shipped. Both units (cs2-poller + cs2-enricher) live in dist/ and are
+# installed + wired for enable/start/restart by cargo-deb's systemd
+# integration. `unit-scripts` MUST point at the directory holding the
+# .service files — cargo-deb otherwise searches maintainer-scripts/, finds
+# nothing, and silently ships the units without the systemctl hooks. This deb
+# ships TWO units, so systemd-units is an ARRAY with an explicit unit-name per
+# entry — a single table with no unit-name only integrates the unit whose name
+# matches the package, silently dropping the other. Do NOT also list the
+# .service files as assets (that would double-install them).
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+name = "portal-steam-bot"
+maintainer = "Gaming Portal Ops <ops@gaming-portal.invalid>"
+copyright = "2026, Gaming Portal"
+extended-description = """\
+CS2 match-tracking bots. cs2-poller discovers new match share codes via the \
+Steam Web API for opted-in players; cs2-enricher fetches full match data \
+(including rank/ELO) from the CS2 Game Coordinator using a dedicated bot \
+account."""
+depends = "$auto, ca-certificates"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/cs2-poller", "usr/bin/cs2-poller", "755"],
+    ["target/release/cs2-enricher", "usr/bin/cs2-enricher", "755"],
+    ["dist/cs2-poller.env.example", "etc/portal/cs2-poller.env.example", "0644"],
+    ["dist/cs2-enricher.env.example", "etc/portal/cs2-enricher.env.example", "0644"],
+]
+maintainer-scripts = "dist/maintainer-scripts"
+# /etc/portal/{cs2-poller,cs2-enricher}.env are created by postinst (not
+# shipped), so they are deliberately NOT conf-files; the shipped *.env.example
+# files are auto-marked as conffiles by cargo-deb since they live under /etc.
+systemd-units = [
+    { unit-name = "cs2-poller", unit-scripts = "dist", enable = true, start = true, restart-after-upgrade = true },
+    { unit-name = "cs2-enricher", unit-scripts = "dist", enable = true, start = true, restart-after-upgrade = true },
+]

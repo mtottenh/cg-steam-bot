@@ -1,0 +1,47 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # The `portal` user is normally created by portal-api's postinst.
+        # Create a minimal one if the bots are installed standalone.
+        if ! getent passwd portal >/dev/null; then
+            adduser --system --group \
+                --home /var/lib/portal \
+                --no-create-home \
+                --shell /usr/sbin/nologin \
+                --gecos "Gaming Portal" \
+                portal
+        fi
+
+        install -d -o portal -g portal -m 0750 /var/lib/portal
+        install -d -o root   -g portal -m 0750 /etc/portal
+
+        for svc in cs2-poller cs2-enricher; do
+            if [ ! -f "/etc/portal/${svc}.env" ]; then
+                cp "/etc/portal/${svc}.env.example" "/etc/portal/${svc}.env"
+                chown root:portal "/etc/portal/${svc}.env"
+                chmod 0640 "/etc/portal/${svc}.env"
+                echo "portal-steam-bot: seeded /etc/portal/${svc}.env from example"
+            fi
+        done
+
+        # Enable but DO NOT start — the env still holds CHANGE_ME
+        # placeholders until the Ansible role renders the real values and
+        # starts the units. Enabling here means a plain apt install still
+        # wires them into multi-user.target.
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+            systemctl enable cs2-poller.service cs2-enricher.service || true
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure) ;;
+
+    *)
+        echo "postinst: unknown arg $1" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#

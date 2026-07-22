@@ -1,0 +1,11 @@
+[package]
+name = "steam-totp"
+version = "0.1.0"
+edition = "2021"
+description = "Steam Guard TOTP code generator"
+
+[dependencies]
+base64 = "0.22"
+hmac = "0.12"
+sha1 = "0.10"
+clap.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "cs2-gc"
+version = "0.1.0"
+edition = "2021"
+description = "High-level CS2 Game Coordinator client library built on steam-vent"
+
+[dependencies]
+steam-vent.workspace = true
+steam-vent-proto.workspace = true
+steam-vent-proto-csgo.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tokio-stream.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+protobuf = "3"
+cs2-sharecode = { path = "../cs2-sharecode" }
+cs2-provider = { path = "../cs2-provider" }
+serde.workspace = true
