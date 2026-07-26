@@ -1,0 +1,41 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Only on `dpkg --purge portal-steam-bot`. /etc/portal and the
+        # `portal` user are shared with portal-api/scanner/demo-stats when
+        # co-hosted: remove only what this package owns; drop the shared
+        # user only when no other portal package remains. /var/lib/portal
+        # and /etc/portal/agent-ca are never touched by any package.
+        rm -f /etc/portal/cs2-poller.env /etc/portal/cs2-enricher.env
+        rmdir /etc/portal 2>/dev/null || true
+
+        others=""
+        for pkg in portal-api portal-scanner portal-demo-stats; do
+            if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q ' installed$'; then
+                others="$others $pkg"
+            fi
+        done
+        if [ -n "$others" ]; then
+            echo "portal-steam-bot: keeping /etc/portal and the portal user (still used by:$others)"
+        else
+            if getent passwd portal >/dev/null; then
+                deluser --quiet --system portal || true
+            fi
+            if getent group portal >/dev/null; then
+                delgroup --quiet --system portal 2>/dev/null || true
+            fi
+        fi
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1\`" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
