@@ -5,7 +5,11 @@ After=network-online.target portal-api.service
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Type=notify: the daemon sends READY once its clients (and, for the
+# enricher, nothing blocking — the GC session connects lazily) are set up,
+# and STOPPING on graceful shutdown. In-flight cycles finish before exit.
+Type=notify
+NotifyAccess=main
 User=portal
 Group=portal
 WorkingDirectory=/var/lib/portal

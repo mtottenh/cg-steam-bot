@@ -1,0 +1,17 @@
+[package]
+name = "portal-daemon"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared daemon plumbing for the portal bots: loopback /metrics + /healthz listener, graceful shutdown, jittered ticker"
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+rand.workspace = true
+sd-notify.workspace = true

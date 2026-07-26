@@ -40,7 +40,11 @@ use tracing::{debug, info, warn};
 use steam_vent_proto_csgo::cstrike15_gcmessages as pb;
 
 pub use crate::provider::GcProvider;
-use crate::transport::{GcTransport, GcTransportError};
+// Re-exported so consumers (cs2-enricher) can classify session-fatal
+// transport failures (StreamClosed) and reconnect instead of burning the
+// per-match retry budget on a dead session.
+use crate::transport::GcTransport;
+pub use crate::transport::GcTransportError;
 use crate::types::{MatchInfo, OwnProfile};
 
 /// How long to wait for a GC response before giving up.

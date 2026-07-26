@@ -7,6 +7,8 @@ description = "CS2 match enricher bot — fetches full match data from the Game 
 
 [dependencies]
 cs2-gc = { path = "../../crates/cs2-gc" }
+portal-daemon = { path = "../../crates/portal-daemon" }
+metrics.workspace = true
 cs2-sharecode = { path = "../../crates/cs2-sharecode" }
 cs2-demo-rank = { path = "../../crates/cs2-demo-rank" }
 steam-vent.workspace = true

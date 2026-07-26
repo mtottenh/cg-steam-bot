@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use cs2_demo_rank::RankUpdate;
-use cs2_gc::Cs2GcClient;
+use cs2_gc::{Cs2GcClient, GcTransportError};
 use parallel_bzip2_decoder::{decompress_block, scan_blocks};
 use rayon::prelude::*;
 use reqwest::Client;
@@ -14,7 +14,7 @@ use std::time::Duration;
 use steam_vent::auth::{
     ConsoleAuthConfirmationHandler, FileGuardDataStore, SharedSecretAuthConfirmationHandler,
 };
-use steam_vent::{Connection, ServerList};
+use steam_vent::{Connection, ConnectionError, LoginError, ServerList};
 use tracing::{error, info, warn};
 
 /// CS2 match enricher bot.
@@ -194,6 +194,28 @@ impl PortalClient {
 // Steam / GC connection
 // =============================================================================
 
+/// Classify a `connect_gc` failure for `cs2_enricher_logon_failures_total`.
+/// Each reason needs a different human response: bad-creds → fix the vault,
+/// steam-guard → re-auth the bot account, rate-limit → wait.
+fn classify_logon_failure(e: &(dyn std::error::Error + 'static)) -> &'static str {
+    if let Some(conn_err) = e.downcast_ref::<ConnectionError>() {
+        return match conn_err {
+            ConnectionError::LoginError(login) => match login {
+                LoginError::InvalidCredentials => "bad-creds",
+                LoginError::SteamGuardRequired => "steam-guard",
+                LoginError::RateLimited => "rate-limit",
+                _ => "login-other",
+            },
+            ConnectionError::Network(_) => "network",
+            _ => "other",
+        };
+    }
+    if e.downcast_ref::<cs2_gc::Error>().is_some() {
+        return "gc-handshake";
+    }
+    "other"
+}
+
 async fn connect_gc(args: &Args) -> Result<Cs2GcClient, Box<dyn std::error::Error>> {
     let password = match args.password {
         Some(ref p) => p.clone(),
@@ -314,6 +336,19 @@ async fn download_and_extract_demo(
 // Main loop
 // =============================================================================
 
+/// Enrichment of one batch can legitimately take minutes (GC calls at 2s
+/// spacing + up to 120s per demo download), so the cycle deadline is a
+/// generous backstop, not the poll interval.
+const CYCLE_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Coarse buckets for per-match enrichment (GC fetch + demo download +
+/// bzip2 + rank scan).
+const ENRICH_DURATION_BUCKETS: &[f64] = &[1.0, 2.5, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0];
+
+/// Reconnect backoff bounds for the GC session.
+const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -333,31 +368,125 @@ async fn main() {
         "Starting CS2 enricher bot"
     );
 
-    let mut gc = match connect_gc(&args).await {
-        Ok(gc) => gc,
-        Err(e) => {
-            error!("Failed to connect to Steam GC: {e}");
-            std::process::exit(1);
-        }
-    };
+    let interval = Duration::from_secs(args.enrich_interval);
+    // /healthz goes stale (503) when no cycle has succeeded for 3×interval
+    // (bounded below by the cycle deadline — a busy cycle is not "stale").
+    let health = portal_daemon::Health::new((interval * 3).max(CYCLE_DEADLINE));
+    portal_daemon::start_from_env(
+        "cs2_enricher_build_info",
+        env!("CARGO_PKG_VERSION"),
+        &[(
+            "cs2_enricher_enrich_duration_seconds",
+            ENRICH_DURATION_BUCKETS,
+        )],
+        std::sync::Arc::clone(&health),
+    );
 
     let portal = PortalClient::new(&args.portal_api_url, &args.portal_api_key);
-    let interval = Duration::from_secs(args.enrich_interval);
+
+    // The GC session is the fragile part — it is now a first-class state
+    // (gc_session_up gauge) with reconnect instead of the old
+    // connect-once-then-exit shape that let a dead session mark every
+    // pending match failed.
+    let mut gc: Option<Cs2GcClient> = None;
+    let mut backoff = RECONNECT_BACKOFF_INITIAL;
+
+    portal_daemon::notify_ready();
+    let shutdown = portal_daemon::shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
-        if let Err(e) = enrich_cycle(
-            &portal,
-            &mut gc,
-            &args.game_slug,
-            args.batch_size,
-            args.skip_demo_rank,
-        )
-        .await
-        {
-            error!("Enrich cycle error: {e}");
+        // (Re)establish the GC session when absent.
+        if gc.is_none() {
+            match connect_gc(&args).await {
+                Ok(client) => {
+                    metrics::gauge!("cs2_enricher_gc_session_up").set(1.0);
+                    gc = Some(client);
+                    backoff = RECONNECT_BACKOFF_INITIAL;
+                }
+                Err(e) => {
+                    let reason = classify_logon_failure(e.as_ref());
+                    metrics::gauge!("cs2_enricher_gc_session_up").set(0.0);
+                    metrics::counter!("cs2_enricher_logon_failures_total", "reason" => reason)
+                        .increment(1);
+                    error!(
+                        reason,
+                        backoff_secs = backoff.as_secs(),
+                        "Failed to connect to Steam GC: {e}"
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(backoff) => {}
+                        () = &mut shutdown => break,
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    continue;
+                }
+            }
+        }
+        let Some(gc_client) = gc.as_mut() else {
+            unreachable!("gc is Some after successful connect")
+        };
+
+        tokio::select! {
+            cycle = tokio::time::timeout(
+                CYCLE_DEADLINE,
+                enrich_cycle(&portal, gc_client, &args.game_slug, args.batch_size, args.skip_demo_rank),
+            ) => {
+                match cycle {
+                    Ok(Ok(())) => {
+                        health.mark_success();
+                        metrics::gauge!("cs2_enricher_last_success_timestamp_seconds")
+                            .set(portal_daemon::unix_now_f64());
+                    }
+                    Ok(Err(CycleError::GcSession(e))) => {
+                        // Session-fatal: drop the client and reconnect next
+                        // pass rather than failing every pending match.
+                        metrics::gauge!("cs2_enricher_gc_session_up").set(0.0);
+                        metrics::counter!("cs2_enricher_gc_reconnects_total", "reason" => "stream-closed")
+                            .increment(1);
+                        warn!("GC session lost, reconnecting: {e}");
+                        gc = None;
+                        continue;
+                    }
+                    Ok(Err(CycleError::Portal(e))) => {
+                        error!("Enrich cycle error: {e}");
+                    }
+                    Err(_) => {
+                        warn!(
+                            deadline_secs = CYCLE_DEADLINE.as_secs(),
+                            "Enrich cycle exceeded its deadline; skipping to next tick"
+                        );
+                    }
+                }
+            }
+            () = &mut shutdown => break,
         }
 
-        tokio::time::sleep(interval).await;
+        let sleep = interval + portal_daemon::jitter(interval / 10);
+        tokio::select! {
+            () = tokio::time::sleep(sleep) => {}
+            () = &mut shutdown => break,
+        }
+    }
+
+    portal_daemon::notify_stopping();
+    info!("shutdown complete");
+}
+
+/// Cycle-level failures, split by required reaction.
+enum CycleError {
+    /// Portal API unreachable — retry next tick.
+    Portal(reqwest::Error),
+    /// GC session died — reconnect before the next cycle.
+    GcSession(cs2_gc::Error),
+}
+
+impl std::fmt::Display for CycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Portal(e) => write!(f, "portal API: {e}"),
+            Self::GcSession(e) => write!(f, "GC session: {e}"),
+        }
     }
 }
 
@@ -367,8 +496,16 @@ async fn enrich_cycle(
     game_slug: &str,
     batch_size: i64,
     skip_demo_rank: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let pending = portal.get_pending_matches(game_slug, batch_size).await?;
+) -> Result<(), CycleError> {
+    let pending = portal
+        .get_pending_matches(game_slug, batch_size)
+        .await
+        .map_err(CycleError::Portal)?;
+
+    // Clamped by batch_size, so this saturates rather than showing the true
+    // backlog — still the right signal for "work keeps arriving faster than
+    // we drain it".
+    metrics::gauge!("cs2_enricher_queue_depth").set(pending.len() as f64);
 
     if pending.is_empty() {
         return Ok(());
@@ -411,6 +548,7 @@ async fn enrich_cycle(
 
         // Call GC for full match data
         last_gc_call = Some(tokio::time::Instant::now());
+        let enrich_start = tokio::time::Instant::now();
         match gc
             .match_info(m.match_id as u64, m.outcome_id as u64, m.token as u32)
             .await
@@ -438,6 +576,14 @@ async fn enrich_cycle(
                                         rank_change: r.rank_change,
                                     })
                                     .collect();
+                                // "empty" is a real third outcome: casual/DM
+                                // demos parse fine but carry no rank updates.
+                                let outcome = if entries.is_empty() { "empty" } else { "ok" };
+                                metrics::counter!(
+                                    "cs2_enricher_rank_extractions_total",
+                                    "outcome" => outcome
+                                )
+                                .increment(1);
                                 let ratings = if entries.is_empty() {
                                     None
                                 } else {
@@ -446,6 +592,11 @@ async fn enrich_cycle(
                                 (ratings, extraction.map_name)
                             }
                             Err(e) => {
+                                metrics::counter!(
+                                    "cs2_enricher_rank_extractions_total",
+                                    "outcome" => "error"
+                                )
+                                .increment(1);
                                 warn!(
                                     match_id = %m.id,
                                     error = %e,
@@ -470,7 +621,7 @@ async fn enrich_cycle(
                     "Got GC data, submitting enriched result"
                 );
 
-                if let Err(e) = portal
+                match portal
                     .submit_enriched(
                         &m.id,
                         &EnrichedMatchRequest {
@@ -482,10 +633,32 @@ async fn enrich_cycle(
                     )
                     .await
                 {
-                    error!(match_id = %m.id, "Failed to submit enriched data: {e}");
+                    Ok(()) => {
+                        metrics::counter!("cs2_enricher_matches_enriched_total", "outcome" => "ok")
+                            .increment(1);
+                    }
+                    Err(e) => {
+                        metrics::counter!(
+                            "cs2_enricher_matches_enriched_total",
+                            "outcome" => "submit-error"
+                        )
+                        .increment(1);
+                        error!(match_id = %m.id, "Failed to submit enriched data: {e}");
+                    }
                 }
+                metrics::histogram!("cs2_enricher_enrich_duration_seconds")
+                    .record(enrich_start.elapsed().as_secs_f64());
             }
             Err(e) => {
+                // A closed GC stream is session death, not a bad match:
+                // reconnect instead of marking every pending match failed
+                // at batch_size per cycle (the old crash-the-budget bug).
+                if matches!(&e, cs2_gc::Error::Transport(GcTransportError::StreamClosed)) {
+                    return Err(CycleError::GcSession(e));
+                }
+
+                metrics::counter!("cs2_enricher_matches_enriched_total", "outcome" => "gc-error")
+                    .increment(1);
                 warn!(
                     match_id = %m.id,
                     share_code = %m.share_code,
