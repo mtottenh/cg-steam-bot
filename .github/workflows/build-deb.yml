@@ -104,8 +104,8 @@ jobs:
           test -x /usr/bin/cs2-poller
           test -x /usr/bin/cs2-enricher
           getent passwd portal
-          test -f /etc/portal/cs2-poller.env
-          test -f /etc/portal/cs2-enricher.env
+          sudo test -f /etc/portal/cs2-poller.env
+          sudo test -f /etc/portal/cs2-enricher.env
           # Enabled is what matters; the services can't run on CHANGE_ME env.
           systemctl is-enabled cs2-poller
           systemctl is-enabled cs2-enricher
@@ -114,8 +114,8 @@ jobs:
         run: |
           set -x
           sudo dpkg --purge portal-steam-bot
-          ! test -e /etc/portal/cs2-poller.env
-          ! test -e /etc/portal/cs2-enricher.env
+          ! sudo test -e /etc/portal/cs2-poller.env
+          ! sudo test -e /etc/portal/cs2-enricher.env
           ! getent passwd portal
 
   # Attach to the GitHub release only after the smoke install passed.
