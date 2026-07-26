@@ -27,3 +27,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 parallel_bzip2_decoder = "0.2"
 rayon = "1"
 snap = "1"
+# Daemon plumbing (crates/portal-daemon): loopback /metrics + /healthz
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+rand = "0.9"
+sd-notify = "0.4"

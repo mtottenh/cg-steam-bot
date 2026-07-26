@@ -8,7 +8,7 @@ use cs2_webapi::Cs2WebApiClient;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// CS2 match poller bot.
 #[derive(Parser)]
@@ -142,6 +142,10 @@ impl PortalClient {
 // Main loop
 // =============================================================================
 
+/// Coarse buckets for whole poll cycles: 1 req/s Steam rate limiting means
+/// a cycle scales with tracked players × new codes.
+const CYCLE_DURATION_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0];
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -164,13 +168,65 @@ async fn main() {
     let steam = Cs2WebApiClient::new(&args.steam_api_key);
     let interval = Duration::from_secs(args.poll_interval);
 
-    loop {
-        if let Err(e) = poll_cycle(&portal, &steam, &args.game_slug).await {
-            error!("Poll cycle error: {e}");
-        }
+    // /healthz goes stale (503) when no cycle has succeeded for 3×interval —
+    // the same window the StaleLoop alert uses on the metric.
+    let health = portal_daemon::Health::new(interval * 3);
+    portal_daemon::start_from_env(
+        "cs2_poller_build_info",
+        env!("CARGO_PKG_VERSION"),
+        &[("cs2_poller_cycle_duration_seconds", CYCLE_DURATION_BUCKETS)],
+        std::sync::Arc::clone(&health),
+    );
+    portal_daemon::notify_ready();
 
-        tokio::time::sleep(interval).await;
+    let shutdown = portal_daemon::shutdown_signal();
+    tokio::pin!(shutdown);
+
+    loop {
+        let start = std::time::Instant::now();
+        // Per-cycle deadline = poll_interval: an overrunning cycle is
+        // cancelled-and-counted rather than queueing behind the ticker.
+        // Shutdown also interrupts mid-cycle — the poll cursor only
+        // advances after successful submission, so nothing is lost.
+        let outcome = tokio::select! {
+            cycle = tokio::time::timeout(interval, poll_cycle(&portal, &steam, &args.game_slug)) => {
+                match cycle {
+                    Ok(Ok(())) => {
+                        health.mark_success();
+                        metrics::gauge!("cs2_poller_last_success_timestamp_seconds")
+                            .set(portal_daemon::unix_now_f64());
+                        "ok"
+                    }
+                    Ok(Err(e)) => {
+                        error!("Poll cycle error: {e}");
+                        "error"
+                    }
+                    Err(_) => {
+                        warn!(
+                            deadline_secs = interval.as_secs(),
+                            "Poll cycle exceeded its deadline; skipping to next tick"
+                        );
+                        "deadline-exceeded"
+                    }
+                }
+            }
+            () = &mut shutdown => break,
+        };
+        metrics::histogram!("cs2_poller_cycle_duration_seconds")
+            .record(start.elapsed().as_secs_f64());
+        metrics::counter!("cs2_poller_cycles_total", "outcome" => outcome).increment(1);
+
+        // Jittered sleep: avoids thundering-herd against Steam when several
+        // bots share a box.
+        let sleep = interval + portal_daemon::jitter(interval / 10);
+        tokio::select! {
+            () = tokio::time::sleep(sleep) => {}
+            () = &mut shutdown => break,
+        }
     }
+
+    portal_daemon::notify_stopping();
+    info!("shutdown complete");
 }
 
 async fn poll_cycle(
@@ -179,7 +235,10 @@ async fn poll_cycle(
     game_slug: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entries = portal.get_active_tracking(game_slug).await?;
-    info!(count = entries.len(), "Fetched active tracking entries");
+    // Idle-cycle logging stays at debug (observability-design.md §5): the
+    // count lives in the gauge; Loki's error-rate signal stays meaningful.
+    debug!(count = entries.len(), "Fetched active tracking entries");
+    metrics::gauge!("cs2_poller_tracked_players").set(entries.len() as f64);
 
     for entry in &entries {
         // Skip entries with too many errors (backoff)
@@ -190,7 +249,7 @@ async fn poll_cycle(
         let Some(known_code) = &entry.last_known_code else {
             // No cursor yet — user needs to set initial share code or we need
             // a different discovery method. Skip for now.
-            info!(
+            debug!(
                 tracking_id = %entry.id,
                 steam_id = entry.steam_id_64,
                 "No last_known_code — skipping (needs initial share code)"
@@ -198,10 +257,22 @@ async fn poll_cycle(
             continue;
         };
 
-        match steam
+        let steam_result = steam
             .codes_since(entry.steam_id_64 as u64, &entry.game_auth_code, known_code)
-            .await
-        {
+            .await;
+        // Per-entry outcome classification. `auth-expired` is the top
+        // operator signal: that player's match-sharing auth code needs
+        // refreshing (observability-design.md §4.4).
+        let outcome = match &steam_result {
+            Ok(_) => "ok",
+            Err(cs2_webapi::Error::BadAuthCode(_)) => "auth-expired",
+            Err(cs2_webapi::Error::RateLimited) => "rate-limited",
+            Err(cs2_webapi::Error::BadKnownCode(_)) => "bad-known-code",
+            Err(_) => "error",
+        };
+        metrics::counter!("cs2_poller_steam_requests_total", "outcome" => outcome).increment(1);
+
+        match steam_result {
             Ok(codes) if codes.is_empty() => {
                 // No new matches — report success
                 if let Err(e) = portal
@@ -224,6 +295,8 @@ async fn poll_cycle(
                     count = codes.len(),
                     "Discovered new share codes"
                 );
+                metrics::counter!("cs2_poller_sharecodes_discovered_total")
+                    .increment(codes.len() as u64);
 
                 let newest_code = codes.last().expect("non-empty").to_string();
 
@@ -247,9 +320,12 @@ async fn poll_cycle(
                     })
                     .await
                 {
+                    metrics::counter!("cs2_poller_submissions_total", "outcome" => "error")
+                        .increment(1);
                     error!(tracking_id = %entry.id, "Failed to submit matches: {e}");
                     continue;
                 }
+                metrics::counter!("cs2_poller_submissions_total", "outcome" => "ok").increment(1);
 
                 // Update cursor
                 if let Err(e) = portal
