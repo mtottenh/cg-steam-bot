@@ -1,0 +1,12 @@
+[package]
+name = "steam-login-gate"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Steam login helper that answers Steam Guard challenges via the portal-daemon code-entry page"
+
+[dependencies]
+portal-daemon = { path = "../portal-daemon" }
+steam-vent.workspace = true
+tokio.workspace = true
+tracing.workspace = true

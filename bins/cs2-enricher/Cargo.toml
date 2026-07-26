@@ -8,6 +8,7 @@ description = "CS2 match enricher bot — fetches full match data from the Game 
 [dependencies]
 cs2-gc = { path = "../../crates/cs2-gc" }
 portal-daemon = { path = "../../crates/portal-daemon" }
+steam-login-gate = { path = "../../crates/steam-login-gate" }
 metrics.workspace = true
 cs2-sharecode = { path = "../../crates/cs2-sharecode" }
 cs2-demo-rank = { path = "../../crates/cs2-demo-rank" }
@@ -28,11 +29,15 @@ rayon.workspace = true
 # relative to THIS crate's dir (bins/cs2-enricher/), hence dist/ lives here;
 # target/release/ is special-cased to the workspace target dir. Build:
 #
-#   cargo build --release -p cs2-poller -p cs2-enricher
+#   cargo build --release -p cs2-poller -p cs2-enricher -p steam-guard-link
 #   cargo deb -p cs2-enricher --no-build
 #
 # The dev-only bins (cs2-matches, demo-downloader, steam-totp) are NOT
-# shipped. Both units (cs2-poller + cs2-enricher) live in dist/ and are
+# shipped. steam-guard-link (one-shot authenticator bootstrap) IS shipped,
+# with its unit installed as a PLAIN ASSET (not via systemd-units): it is
+# started manually, never enabled at boot — cargo-deb's systemd integration
+# would enable+start it, which is exactly wrong for a one-shot interactive
+# tool. Both bot units (cs2-poller + cs2-enricher) live in dist/ and are
 # installed + wired for enable/start/restart by cargo-deb's systemd
 # integration. `unit-scripts` MUST point at the directory holding the
 # .service files — cargo-deb otherwise searches maintainer-scripts/, finds
@@ -57,8 +62,10 @@ priority = "optional"
 assets = [
     ["target/release/cs2-poller", "usr/bin/cs2-poller", "755"],
     ["target/release/cs2-enricher", "usr/bin/cs2-enricher", "755"],
+    ["target/release/steam-guard-link", "usr/bin/steam-guard-link", "755"],
     ["dist/cs2-poller.env.example", "etc/portal/cs2-poller.env.example", "0644"],
     ["dist/cs2-enricher.env.example", "etc/portal/cs2-enricher.env.example", "0644"],
+    ["dist/steam-guard-link.service", "usr/lib/systemd/system/steam-guard-link.service", "0644"],
 ]
 maintainer-scripts = "dist/maintainer-scripts"
 # /etc/portal/{cs2-poller,cs2-enricher}.env are created by postinst (not

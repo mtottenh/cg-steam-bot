@@ -6,6 +6,10 @@
 //! No framework — one hyper connection handler, ~100 lines, shared by
 //! cs2-poller and cs2-enricher so neither grows its own copy.
 
+mod guard;
+
+pub use guard::{start_guard_from_env, GuardGate, GuardPromptStatus, GuardSubmitOutcome};
+
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::server::conn::http1;

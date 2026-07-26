@@ -1,0 +1,61 @@
+[Unit]
+Description=One-shot Steam mobile authenticator linker (driven via the guard page)
+Documentation=https://github.com/community-gaming/gaming-portal
+After=network-online.target
+Wants=network-online.target
+# Frees GUARD_ADDR (the code-entry port, so the SAME ts.net:8443 page URL
+# serves the linking flow) and prevents two concurrent Steam logins on the
+# bot account. OnSuccess/OnFailure bring the enricher back either way, so
+# a finished or failed linking run never leaves enrichment stopped.
+Conflicts=cs2-enricher.service
+After=cs2-enricher.service
+OnSuccess=cs2-enricher.service
+OnFailure=cs2-enricher.service
+
+[Service]
+# Started MANUALLY (systemctl start steam-guard-link) — no [Install]
+# section on purpose; this must never run unattended at boot.
+Type=exec
+User=portal
+Group=portal
+WorkingDirectory=/var/lib/portal
+# Reuses the enricher's credentials and GUARD_ADDR.
+EnvironmentFile=/etc/portal/cs2-enricher.env
+# Same machine-token cache as the enricher: the login performed here also
+# seeds the token that lets the enricher skip 2FA afterwards.
+CacheDirectory=portal-steam-bot
+Environment=XDG_CACHE_HOME=/var/cache/portal-steam-bot
+Environment=HOME=/var/lib/portal
+# The <account>.maFile (shared secret + revocation code, mode 0600) lands
+# here. Copy the shared secret into the vault after a successful run.
+StateDirectory=portal-steam-bot
+Environment=MAFILE_DIR=/var/lib/portal-steam-bot
+
+ExecStart=/usr/bin/steam-guard-link
+
+# Abandoned runs must not hold a Steam session (or the page port) forever.
+RuntimeMaxSec=2h
+Restart=no
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=steam-guard-link

@@ -7,14 +7,13 @@ use clap::Parser;
 use cs2_demo_rank::RankUpdate;
 use cs2_gc::{Cs2GcClient, GcTransportError};
 use parallel_bzip2_decoder::{decompress_block, scan_blocks};
+use portal_daemon::GuardGate;
 use rayon::prelude::*;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
-use steam_vent::auth::{
-    ConsoleAuthConfirmationHandler, FileGuardDataStore, SharedSecretAuthConfirmationHandler,
-};
-use steam_vent::{Connection, ConnectionError, LoginError, ServerList};
+use steam_vent::{ConnectionError, LoginError, ServerList};
 use tracing::{error, info, warn};
 
 /// CS2 match enricher bot.
@@ -207,6 +206,9 @@ fn classify_logon_failure(e: &(dyn std::error::Error + 'static)) -> &'static str
                 _ => "login-other",
             },
             ConnectionError::Network(_) => "network",
+            // The guard gate aborts the login when no code arrives in time;
+            // the next reconnect pass re-arms the code-entry page.
+            ConnectionError::Aborted => "guard-timeout",
             _ => "other",
         };
     }
@@ -216,7 +218,10 @@ fn classify_logon_failure(e: &(dyn std::error::Error + 'static)) -> &'static str
     "other"
 }
 
-async fn connect_gc(args: &Args) -> Result<Cs2GcClient, Box<dyn std::error::Error>> {
+async fn connect_gc(
+    args: &Args,
+    guard: Option<&Arc<GuardGate>>,
+) -> Result<Cs2GcClient, Box<dyn std::error::Error>> {
     let password = match args.password {
         Some(ref p) => p.clone(),
         None => rpassword::prompt_password("Steam password: ")?,
@@ -226,27 +231,24 @@ async fn connect_gc(args: &Args) -> Result<Cs2GcClient, Box<dyn std::error::Erro
     let server_list = ServerList::discover().await?;
 
     info!(username = %args.username, "Logging in to Steam...");
-    let guard_data = FileGuardDataStore::user_cache();
 
-    let connection = if let Some(ref secret) = args.shared_secret {
-        Connection::login(
-            &server_list,
-            &args.username,
-            &password,
-            guard_data,
-            SharedSecretAuthConfirmationHandler::new(secret),
-        )
-        .await?
-    } else {
-        Connection::login(
-            &server_list,
-            &args.username,
-            &password,
-            guard_data,
-            ConsoleAuthConfirmationHandler::default(),
-        )
-        .await?
-    };
+    // An empty STEAM_SHARED_SECRET (vault placeholder) means "not set" —
+    // silently generating codes from an empty secret would soft-lock login.
+    let shared_secret = args
+        .shared_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let connection = steam_login_gate::login(
+        &server_list,
+        &args.username,
+        &password,
+        shared_secret,
+        guard,
+        steam_login_gate::DEFAULT_GUARD_CODE_WAIT,
+    )
+    .await?;
 
     info!("Logged in. Connecting to CS2 Game Coordinator...");
     let mut cs2 = Cs2GcClient::connect(connection).await?;
@@ -382,6 +384,13 @@ async fn main() {
         std::sync::Arc::clone(&health),
     );
 
+    // Remote Steam Guard code entry (GUARD_ADDR, tailnet-only ingress via
+    // Tailscale Serve). Only consulted when no shared secret is configured
+    // and the stored machine token doesn't satisfy the login.
+    let guard_gate = GuardGate::new("cs2_enricher");
+    let guard_gate =
+        portal_daemon::start_guard_from_env(Arc::clone(&guard_gate)).then_some(guard_gate);
+
     let portal = PortalClient::new(&args.portal_api_url, &args.portal_api_key);
 
     // The GC session is the fragile part — it is now a first-class state
@@ -398,7 +407,7 @@ async fn main() {
     loop {
         // (Re)establish the GC session when absent.
         if gc.is_none() {
-            match connect_gc(&args).await {
+            match connect_gc(&args, guard_gate.as_ref()).await {
                 Ok(client) => {
                     metrics::gauge!("cs2_enricher_gc_session_up").set(1.0);
                     gc = Some(client);
