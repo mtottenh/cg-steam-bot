@@ -21,12 +21,20 @@
 //!     "CSGO-xxxxx-xxxxx-xxxxx-xxxxx-xxxxx",
 //! ).await?;
 //!
-//! // Walk: collect all codes since a known one
-//! let codes = client.codes_since(
+//! // Walk: collect all codes since a known one. Returns codes AND any error
+//! // together, because a walk that failed partway still found real matches
+//! // and throwing them away means re-walking the same prefix forever.
+//! let walk = client.codes_since(
 //!     76561198012345678,
 //!     "AAAA-AAAAA-AAAA",
 //!     "CSGO-xxxxx-xxxxx-xxxxx-xxxxx-xxxxx",
-//! ).await?;
+//! ).await;
+//! for code in &walk.codes {
+//!     println!("{code}");
+//! }
+//! if let Some(e) = &walk.error {
+//!     eprintln!("walk stopped early: {e}");
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -49,6 +57,38 @@ const BASE_URL: &str = "https://api.steampowered.com/ICSGOPlayers_730/GetNextMat
 /// and conservative enough to avoid per-user 429s when polling sequentially.
 fn default_quota() -> Quota {
     Quota::per_second(NonZeroU32::new(1).unwrap())
+}
+
+/// Cap on how many codes one [`Cs2WebApiClient::codes_since`] walk collects.
+///
+/// The walk is one serialised request per code at 1 req/s, so a player
+/// returning after a long break could otherwise hold the poll cycle for
+/// minutes and blow its deadline — starving every other tracked player. The
+/// cursor advances by whatever was collected, so the next cycle picks up
+/// exactly where this one stopped.
+const MAX_CODES_PER_WALK: usize = 50;
+
+/// Result of walking forward from a cursor.
+///
+/// Carries codes and error together rather than being a `Result`, because a
+/// partial walk is a normal outcome with real value in it: the codes found
+/// before the failure are still new matches, and banking them is what lets the
+/// cursor advance.
+#[derive(Debug)]
+pub struct CodeWalk {
+    /// Codes discovered this walk, oldest first. May be non-empty even when
+    /// `error` is set.
+    pub codes: Vec<ShareCode>,
+    /// Why the walk stopped early, if it did. `None` means it caught up.
+    pub error: Option<Error>,
+}
+
+impl CodeWalk {
+    /// The newest code found, which becomes the new cursor.
+    #[must_use]
+    pub fn newest(&self) -> Option<&ShareCode> {
+        self.codes.last()
+    }
 }
 
 type Limiter = RateLimiter<
@@ -195,26 +235,41 @@ impl Cs2WebApiClient {
     /// Rate limiting is handled by the client's [`governor`] limiter — each
     /// call to [`next_share_code`](Self::next_share_code) awaits a token.
     /// Returns codes oldest-first.
-    pub async fn codes_since(
-        &self,
-        steam_id: u64,
-        auth_code: &str,
-        known_code: &str,
-    ) -> Result<Vec<ShareCode>, Error> {
+    ///
+    /// **Partial progress is returned, not discarded.** This used to be
+    /// `Result<Vec<ShareCode>, Error>`, so a failure on the fourth request
+    /// threw away the three codes already found AND left the cursor where it
+    /// started — meaning the next cycle re-walked the same prefix and, for a
+    /// player whose walk reliably broke partway, made no progress ever.
+    pub async fn codes_since(&self, steam_id: u64, auth_code: &str, known_code: &str) -> CodeWalk {
         let mut codes = Vec::new();
         let mut current = known_code.to_string();
+        let mut error = None;
 
-        while let Some(sc) = self.next_share_code(steam_id, auth_code, &current).await? {
-            codes.push(sc);
-            current = sc.encode();
+        while codes.len() < MAX_CODES_PER_WALK {
+            match self.next_share_code(steam_id, auth_code, &current).await {
+                // Caught up.
+                Ok(None) => break,
+                Ok(Some(sc)) => {
+                    codes.push(sc);
+                    current = sc.encode();
+                }
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
         }
 
         debug!(
             steam_id,
             count = codes.len(),
+            truncated = codes.len() >= MAX_CODES_PER_WALK,
+            failed = error.is_some(),
             "Finished walking share codes"
         );
-        Ok(codes)
+
+        CodeWalk { codes, error }
     }
 }
 
@@ -287,8 +342,18 @@ impl MatchProvider for WebApiProvider {
             .clone();
 
         let known_str = known_code.encode();
-        self.client
+        let walk = self
+            .client
             .codes_since(steam_id, &auth_code, &known_str)
-            .await
+            .await;
+
+        // The trait is all-or-nothing, so a partial walk has to surface as an
+        // error here — there is nowhere to put the codes. The poller does not
+        // go through this path precisely because it needs to bank them; it
+        // calls `codes_since` directly.
+        match walk.error {
+            Some(e) => Err(e),
+            None => Ok(walk.codes),
+        }
     }
 }
