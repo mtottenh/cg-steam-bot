@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "cs2-enricher"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "clap",
  "cs2-demo-rank",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "cs2-poller"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "cs2-webapi",

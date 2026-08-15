@@ -1,6 +1,6 @@
 [package]
 name = "cs2-poller"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "CS2 share code poller bot — discovers new matches via Steam Web API"
 
