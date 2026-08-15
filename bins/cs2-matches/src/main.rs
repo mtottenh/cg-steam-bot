@@ -246,9 +246,24 @@ async fn run_webapi_mode(
     }
 
     let webapi = Cs2WebApiClient::new(api_key);
-    let new_codes = webapi
+    let walk = webapi
         .codes_since(target_id, auth_code_str, &known_code.encode())
-        .await?;
+        .await;
+
+    // A walk that stopped early still found real matches, so use them rather
+    // than discarding the lot. But an empty result from a *failed* walk is not
+    // "no new matches" — reporting it as such would be a lie to the caller.
+    let new_codes = match (walk.error, walk.codes.is_empty()) {
+        (Some(e), true) => return Err(e.into()),
+        (Some(e), false) => {
+            eprintln!(
+                "[!] Walk stopped early after {} match(es): {e}",
+                walk.codes.len()
+            );
+            walk.codes
+        }
+        (None, _) => walk.codes,
+    };
 
     if !args.json {
         println!("[+] Found {} new match(es).", new_codes.len());
