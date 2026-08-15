@@ -49,6 +49,13 @@ struct TrackingEntry {
     steam_id_64: i64,
     game_auth_code: String,
     last_known_code: Option<String>,
+    /// Consecutive transient failures, for logging only.
+    ///
+    /// The poller no longer acts on this. Deciding when to retry from a
+    /// counter it held in a request body is exactly what went wrong: the
+    /// threshold lived here, the state lived in the portal, and nothing could
+    /// reconcile them. The portal now returns only entries that are due.
+    #[allow(dead_code)]
     poll_errors: i32,
 }
 
@@ -71,8 +78,33 @@ struct MatchEntry {
 struct PollResultRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_known_code: Option<String>,
+    /// How the poll ended. The portal schedules from this — a revoked token
+    /// and a network blip need opposite responses, and reporting only an
+    /// error string cannot tell them apart.
+    outcome: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+/// Map a Steam Web API failure onto the portal's scheduling vocabulary.
+///
+/// This classification is the whole fix. The old code counted every failure
+/// identically and abandoned the entry at ten, which meant a rate-limit storm
+/// could permanently kill every tracked player, while a genuinely revoked
+/// token was retried nine pointless times before going quiet with no
+/// explanation of what a human should do about it.
+const fn classify(error: &cs2_webapi::Error) -> &'static str {
+    match error {
+        // Steam rejected the auth code. Retrying cannot help; only the player
+        // supplying a new one can.
+        cs2_webapi::Error::BadAuthCode(_) => "auth-expired",
+        // Steam rejected our cursor. Retrying with the same cursor cannot help.
+        cs2_webapi::Error::BadKnownCode(_) => "cursor-invalid",
+        // Ours, not theirs: back the entry off without holding it responsible.
+        cs2_webapi::Error::RateLimited => "rate-limited",
+        // Network, 5xx, decode failures — worth trying again, indefinitely.
+        _ => "transient",
+    }
 }
 
 // =============================================================================
@@ -241,10 +273,12 @@ async fn poll_cycle(
     metrics::gauge!("cs2_poller_tracked_players").set(entries.len() as f64);
 
     for entry in &entries {
-        // Skip entries with too many errors (backoff)
-        if entry.poll_errors >= 10 {
-            continue;
-        }
+        // No client-side skipping. The portal returns only entries that are
+        // active, unpaused and due — it owns the schedule, because it is the
+        // only side that can record one durably. The old `poll_errors >= 10`
+        // check here was a one-way door: a skipped entry never got a
+        // successful poll, `poll_errors` only reset on success, so nothing the
+        // system could do would ever bring it back.
 
         let Some(known_code) = &entry.last_known_code else {
             // No cursor yet — user needs to set initial share code or we need
@@ -257,111 +291,100 @@ async fn poll_cycle(
             continue;
         };
 
-        let steam_result = steam
+        // The walk returns codes AND an error, not one or the other: codes
+        // found before a mid-walk failure are still new matches, and banking
+        // them is what lets the cursor advance past them.
+        let walk = steam
             .codes_since(entry.steam_id_64 as u64, &entry.game_auth_code, known_code)
             .await;
-        // Per-entry outcome classification. `auth-expired` is the top
-        // operator signal: that player's match-sharing auth code needs
-        // refreshing (observability-design.md §4.4).
-        let outcome = match &steam_result {
-            Ok(_) => "ok",
-            Err(cs2_webapi::Error::BadAuthCode(_)) => "auth-expired",
-            Err(cs2_webapi::Error::RateLimited) => "rate-limited",
-            Err(cs2_webapi::Error::BadKnownCode(_)) => "bad-known-code",
-            Err(_) => "error",
-        };
+
+        let outcome = walk.error.as_ref().map_or("ok", classify);
         metrics::counter!("cs2_poller_steam_requests_total", "outcome" => outcome).increment(1);
 
-        match steam_result {
-            Ok(codes) if codes.is_empty() => {
-                // No new matches — report success
-                if let Err(e) = portal
-                    .update_poll_result(
-                        &entry.id,
-                        &PollResultRequest {
-                            last_known_code: None,
-                            error: None,
-                        },
-                    )
-                    .await
-                {
-                    warn!(tracking_id = %entry.id, "Failed to update poll result: {e}");
+        // Submit whatever the walk found, regardless of how it ended.
+        let mut newest_code = None;
+        if !walk.codes.is_empty() {
+            info!(
+                tracking_id = %entry.id,
+                steam_id = entry.steam_id_64,
+                count = walk.codes.len(),
+                partial = walk.error.is_some(),
+                "Discovered new share codes"
+            );
+            metrics::counter!("cs2_poller_sharecodes_discovered_total")
+                .increment(walk.codes.len() as u64);
+
+            let match_entries: Vec<MatchEntry> = walk
+                .codes
+                .iter()
+                .map(|sc| MatchEntry {
+                    share_code: sc.to_string(),
+                    match_id: sc.match_id as i64,
+                    outcome_id: sc.outcome_id as i64,
+                    token: sc.token as i32,
+                })
+                .collect();
+
+            match portal
+                .submit_matches(&SubmitMatchesRequest {
+                    tracking_id: entry.id.clone(),
+                    game: game_slug.to_string(),
+                    matches: match_entries,
+                })
+                .await
+            {
+                Ok(()) => {
+                    metrics::counter!("cs2_poller_submissions_total", "outcome" => "ok")
+                        .increment(1);
+                    // Only advance the cursor once the codes are safely
+                    // submitted — advancing first would skip them for good.
+                    newest_code = walk.codes.last().map(ToString::to_string);
                 }
-            }
-            Ok(codes) => {
-                info!(
-                    tracking_id = %entry.id,
-                    steam_id = entry.steam_id_64,
-                    count = codes.len(),
-                    "Discovered new share codes"
-                );
-                metrics::counter!("cs2_poller_sharecodes_discovered_total")
-                    .increment(codes.len() as u64);
-
-                let newest_code = codes.last().expect("non-empty").to_string();
-
-                // Convert share codes to match entries
-                let match_entries: Vec<MatchEntry> = codes
-                    .iter()
-                    .map(|sc| MatchEntry {
-                        share_code: sc.to_string(),
-                        match_id: sc.match_id as i64,
-                        outcome_id: sc.outcome_id as i64,
-                        token: sc.token as i32,
-                    })
-                    .collect();
-
-                // Submit to Portal API
-                if let Err(e) = portal
-                    .submit_matches(&SubmitMatchesRequest {
-                        tracking_id: entry.id.clone(),
-                        game: game_slug.to_string(),
-                        matches: match_entries,
-                    })
-                    .await
-                {
+                Err(e) => {
                     metrics::counter!("cs2_poller_submissions_total", "outcome" => "error")
                         .increment(1);
                     error!(tracking_id = %entry.id, "Failed to submit matches: {e}");
+                    // Leave the cursor alone and re-walk next cycle. Skip the
+                    // poll-result write entirely: reporting success would move
+                    // the entry on from codes that never landed.
                     continue;
                 }
-                metrics::counter!("cs2_poller_submissions_total", "outcome" => "ok").increment(1);
-
-                // Update cursor
-                if let Err(e) = portal
-                    .update_poll_result(
-                        &entry.id,
-                        &PollResultRequest {
-                            last_known_code: Some(newest_code),
-                            error: None,
-                        },
-                    )
-                    .await
-                {
-                    warn!(tracking_id = %entry.id, "Failed to update poll cursor: {e}");
-                }
             }
-            Err(e) => {
-                warn!(
-                    tracking_id = %entry.id,
-                    steam_id = entry.steam_id_64,
-                    error = %e,
-                    "Poll failed"
-                );
+        }
 
-                if let Err(e2) = portal
-                    .update_poll_result(
-                        &entry.id,
-                        &PollResultRequest {
-                            last_known_code: None,
-                            error: Some(e.to_string()),
-                        },
-                    )
-                    .await
-                {
-                    warn!(tracking_id = %entry.id, "Failed to report poll error: {e2}");
-                }
-            }
+        if let Some(error) = &walk.error {
+            warn!(
+                tracking_id = %entry.id,
+                steam_id = entry.steam_id_64,
+                outcome,
+                codes_banked = walk.codes.len(),
+                error = %error,
+                "Poll failed"
+            );
+        }
+
+        if let Err(e) = portal
+            .update_poll_result(
+                &entry.id,
+                &PollResultRequest {
+                    last_known_code: newest_code,
+                    outcome,
+                    error: walk.error.as_ref().map(ToString::to_string),
+                },
+            )
+            .await
+        {
+            warn!(tracking_id = %entry.id, "Failed to update poll result: {e}");
+        }
+
+        // Steam is refusing us, so the rest of this cycle would be a queue of
+        // guaranteed 429s. Stop here: every entry we would have touched is
+        // still due next cycle, and hammering through them only deepens the
+        // rate limit we are already in.
+        if matches!(walk.error, Some(cs2_webapi::Error::RateLimited)) {
+            warn!("Steam rate-limited us; abandoning the rest of this cycle");
+            metrics::counter!("cs2_poller_cycles_cut_short_total").increment(1);
+            break;
         }
     }
 

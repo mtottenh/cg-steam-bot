@@ -48,6 +48,13 @@ struct Args {
     #[arg(long, env = "BATCH_SIZE", default_value = "5")]
     batch_size: i64,
 
+    /// How many demo-extraction jobs to lease per cycle.
+    ///
+    /// Smaller than `batch_size`: a demo is a multi-hundred-megabyte download
+    /// followed by a CPU-bound parse, where a GC call is one round trip.
+    #[arg(long, env = "DEMO_BATCH_SIZE", default_value = "2")]
+    demo_batch_size: i64,
+
     /// Enrichment interval in seconds.
     #[arg(long, env = "ENRICH_INTERVAL_SECS", default_value = "30")]
     enrich_interval: u64,
@@ -56,7 +63,10 @@ struct Args {
     #[arg(long, env = "GAME_SLUG", default_value = "cs2")]
     game_slug: String,
 
-    /// Skip demo download and rank extraction.
+    /// Skip the demo-extraction stage entirely.
+    ///
+    /// Enrichment still records the demo URL, so the jobs queue up and are
+    /// picked up whenever an enricher runs without this set.
     #[arg(long, env = "SKIP_DEMO_RANK", default_value = "false")]
     skip_demo_rank: bool,
 }
@@ -97,6 +107,30 @@ struct EnrichedMatchRequest<'a, T: Serialize> {
 #[derive(Debug, Serialize)]
 struct FailedMatchRequest {
     error: String,
+}
+
+/// One demo-extraction job leased from the portal.
+///
+/// The lease already banked an attempt against this row before we saw it, so
+/// dying here costs one attempt rather than looping forever.
+#[derive(Debug, Deserialize)]
+struct DemoJob {
+    id: String,
+    share_code: String,
+    demo_url: String,
+    attempt: i32,
+    max_attempts: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct DemoResultRequest<'a> {
+    outcome: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    player_ratings: Option<Vec<PlayerRatingEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    map_name: Option<String>,
 }
 
 // =============================================================================
@@ -181,6 +215,49 @@ impl PortalClient {
             .json(&FailedMatchRequest {
                 error: error.to_string(),
             })
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(())
+    }
+
+    /// Lease demo-extraction jobs.
+    ///
+    /// POST because it mutates: the portal increments each row's attempt
+    /// counter and holds a lease on it, in the same statement that selects it.
+    /// That is what makes the attempt count survive this process dying.
+    async fn lease_demo_jobs(
+        &self,
+        game: &str,
+        limit: i64,
+    ) -> Result<Vec<DemoJob>, reqwest::Error> {
+        self.http
+            .post(format!(
+                "{}/internal/discovered-matches/demo-jobs",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .query(&[("game", game), ("limit", &limit.to_string())])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+    }
+
+    async fn submit_demo_result(
+        &self,
+        match_id: &str,
+        req: &DemoResultRequest<'_>,
+    ) -> Result<(), reqwest::Error> {
+        self.http
+            .post(format!(
+                "{}/internal/discovered-matches/{match_id}/demo-result",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .json(req)
             .send()
             .await?
             .error_for_status()?;
@@ -274,64 +351,149 @@ async fn connect_gc(
 // Demo rank extraction
 // =============================================================================
 
-/// Result of downloading and parsing a demo file.
-struct DemoExtraction {
-    ranks: Vec<RankUpdate>,
-    map_name: Option<String>,
+/// How long to wait on one demo download before giving up on this attempt.
+///
+/// Generous — these are hundreds of megabytes — but bounded, because the whole
+/// point of the retry stage is that abandoning an attempt is now cheap.
+const DEMO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// The outcome of one demo attempt, in the vocabulary the portal's retry stage
+/// speaks.
+///
+/// Classification decides whether the portal schedules another attempt, so the
+/// bias throughout is toward *retryable*. Calling a transient failure permanent
+/// throws the match's rank data away for good — precisely the bug this stage
+/// exists to fix — whereas calling a permanent failure transient costs a
+/// handful of cheap 404s before the budget settles it anyway.
+enum DemoAttempt {
+    /// Parsed with rank updates.
+    Succeeded {
+        ranks: Vec<RankUpdate>,
+        map_name: Option<String>,
+    },
+    /// Parsed cleanly, no rank updates. Casual and deathmatch demos are
+    /// legitimately empty; the map name is still worth keeping.
+    Empty { map_name: Option<String> },
+    /// Not on the CDN yet, or no longer. Retryable.
+    Unavailable(String),
+    /// Any other transient failure. Retryable.
+    Failed(String),
+    /// Explicitly retired by Valve (410). Terminal.
+    Gone(String),
 }
 
-/// Download a `.dem.bz2` demo from Valve CDN, decompress, and extract rank updates + metadata.
-async fn download_and_extract_demo(
-    http: &Client,
-    demo_url: &str,
-) -> Result<DemoExtraction, Box<dyn std::error::Error>> {
+impl DemoAttempt {
+    /// Wire name for the portal's `demo-result` endpoint.
+    const fn outcome(&self) -> &'static str {
+        match self {
+            Self::Succeeded { .. } => "succeeded",
+            Self::Empty { .. } => "empty",
+            Self::Unavailable(_) => "unavailable",
+            Self::Failed(_) => "failed",
+            Self::Gone(_) => "gone",
+        }
+    }
+}
+
+/// Download a `.dem.bz2` demo from the Valve CDN, decompress, and extract rank
+/// updates + metadata.
+///
+/// Returns a classified [`DemoAttempt`] rather than a `Result`: every failure
+/// mode here is a normal, expected state of the pipeline that the portal knows
+/// how to schedule around, not an error for the caller to handle.
+async fn attempt_demo_extraction(http: &Client, demo_url: &str) -> DemoAttempt {
     info!(url = %demo_url, "Downloading demo for rank extraction");
 
-    let response = http
+    let response = match http
         .get(demo_url)
-        .timeout(Duration::from_secs(120))
+        .timeout(DEMO_DOWNLOAD_TIMEOUT)
         .send()
-        .await?
-        .error_for_status()?;
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return DemoAttempt::Failed(format!("download failed: {e}")),
+    };
 
-    let compressed = response.bytes().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return match status.as_u16() {
+            // Valve serves 404 both for "not published yet" and "past
+            // retention". Indistinguishable from here, so retry and let the
+            // budget settle it — a match that ended two minutes ago and one
+            // that ended three weeks ago look identical at this layer.
+            404 => DemoAttempt::Unavailable("demo not present on the CDN (404)".to_string()),
+            410 => DemoAttempt::Gone("demo retired by Valve (410)".to_string()),
+            code => DemoAttempt::Failed(format!("CDN returned HTTP {code}")),
+        };
+    }
+
+    let compressed = match response.bytes().await {
+        Ok(b) => b,
+        Err(e) => return DemoAttempt::Failed(format!("reading demo body failed: {e}")),
+    };
     info!(
         size_bytes = compressed.len(),
         "Demo downloaded, decompressing bzip2"
     );
 
     let blocks: Vec<(u64, u64)> = scan_blocks(&compressed).into_iter().collect();
-    let decompressed_parts: Vec<Vec<u8>> = blocks
+    if blocks.is_empty() {
+        // A 200 carrying no bzip2 blocks is the CDN handing back a placeholder
+        // or an error page, not a demo. Same situation as a 404.
+        return DemoAttempt::Unavailable(format!(
+            "response contained no bzip2 blocks ({} bytes) — not a demo",
+            compressed.len()
+        ));
+    }
+
+    let decompressed = match blocks
         .par_iter()
         .map(|&(start, end)| decompress_block(&compressed, start, end))
-        .collect::<Result<Vec<_>, _>>()?;
-    let total_size: usize = decompressed_parts.iter().map(|p| p.len()).sum();
-    let mut decompressed = Vec::with_capacity(total_size);
-    for part in decompressed_parts {
-        decompressed.extend_from_slice(&part);
-    }
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(parts) => {
+            let total_size: usize = parts.iter().map(Vec::len).sum();
+            let mut out = Vec::with_capacity(total_size);
+            for part in parts {
+                out.extend_from_slice(&part);
+            }
+            out
+        }
+        // Usually a truncated download rather than a corrupt demo, so this is
+        // retryable.
+        Err(e) => return DemoAttempt::Failed(format!("bzip2 decompression failed: {e}")),
+    };
 
     info!(
         decompressed_bytes = decompressed.len(),
         "Decompressed, scanning for rank updates"
     );
 
-    let ranks = cs2_demo_rank::extract_rank_updates(&decompressed)?;
-    let metadata = cs2_demo_rank::extract_demo_metadata(&decompressed).unwrap_or_else(|e| {
-        warn!("Failed to extract demo metadata: {e}");
-        cs2_demo_rank::DemoMetadata { map_name: None }
-    });
+    let ranks = match cs2_demo_rank::extract_rank_updates(&decompressed) {
+        Ok(r) => r,
+        Err(e) => return DemoAttempt::Failed(format!("rank extraction failed: {e}")),
+    };
+
+    // Metadata is a bonus: a demo whose ranks parsed but whose header did not
+    // is still a successful attempt.
+    let map_name = cs2_demo_rank::extract_demo_metadata(&decompressed)
+        .unwrap_or_else(|e| {
+            warn!("Failed to extract demo metadata: {e}");
+            cs2_demo_rank::DemoMetadata { map_name: None }
+        })
+        .map_name;
 
     info!(
         rank_count = ranks.len(),
-        map_name = ?metadata.map_name,
+        map_name = ?map_name,
         "Demo extraction complete"
     );
 
-    Ok(DemoExtraction {
-        ranks,
-        map_name: metadata.map_name,
-    })
+    if ranks.is_empty() {
+        DemoAttempt::Empty { map_name }
+    } else {
+        DemoAttempt::Succeeded { ranks, map_name }
+    }
 }
 
 // =============================================================================
@@ -343,9 +505,21 @@ async fn download_and_extract_demo(
 /// generous backstop, not the poll interval.
 const CYCLE_DEADLINE: Duration = Duration::from_secs(600);
 
-/// Coarse buckets for per-match enrichment (GC fetch + demo download +
-/// bzip2 + rank scan).
-const ENRICH_DURATION_BUCKETS: &[f64] = &[1.0, 2.5, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0];
+/// Deadline for one demo-extraction pass.
+///
+/// Must stay below the portal's demo lease (20 min) so an overrunning pass is
+/// abandoned *before* the rows it holds become eligible for another worker —
+/// otherwise two enrichers download the same demo.
+const DEMO_CYCLE_DEADLINE: Duration = Duration::from_secs(900);
+
+/// Coarse buckets for per-match enrichment. Tighter than they were: enrichment
+/// is now just the GC round trip, with the demo download moved to its own stage.
+const ENRICH_DURATION_BUCKETS: &[f64] = &[0.5, 1.0, 2.5, 5.0, 15.0, 30.0, 60.0, 120.0];
+
+/// Buckets for one demo attempt (CDN fetch + bzip2 + rank scan). Reaches
+/// further out than enrichment — these are hundreds of megabytes.
+const DEMO_ATTEMPT_DURATION_BUCKETS: &[f64] =
+    &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0];
 
 /// Reconnect backoff bounds for the GC session.
 const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
@@ -377,10 +551,16 @@ async fn main() {
     portal_daemon::start_from_env(
         "cs2_enricher_build_info",
         env!("CARGO_PKG_VERSION"),
-        &[(
-            "cs2_enricher_enrich_duration_seconds",
-            ENRICH_DURATION_BUCKETS,
-        )],
+        &[
+            (
+                "cs2_enricher_enrich_duration_seconds",
+                ENRICH_DURATION_BUCKETS,
+            ),
+            (
+                "cs2_enricher_demo_attempt_duration_seconds",
+                DEMO_ATTEMPT_DURATION_BUCKETS,
+            ),
+        ],
         std::sync::Arc::clone(&health),
     );
 
@@ -439,7 +619,7 @@ async fn main() {
         tokio::select! {
             cycle = tokio::time::timeout(
                 CYCLE_DEADLINE,
-                enrich_cycle(&portal, gc_client, &args.game_slug, args.batch_size, args.skip_demo_rank),
+                enrich_cycle(&portal, gc_client, &args.game_slug, args.batch_size),
             ) => {
                 match cycle {
                     Ok(Ok(())) => {
@@ -469,6 +649,27 @@ async fn main() {
                 }
             }
             () = &mut shutdown => break,
+        }
+
+        // Demo extraction runs after enrichment but is not gated on it: it
+        // needs no GC session, so it keeps draining while the GC is down or
+        // reconnecting. Its failures are all handled per-job against the
+        // portal's retry state, so there is nothing for this loop to react to.
+        if !args.skip_demo_rank {
+            tokio::select! {
+                r = tokio::time::timeout(
+                    DEMO_CYCLE_DEADLINE,
+                    demo_cycle(&portal, &args.game_slug, args.demo_batch_size),
+                ) => {
+                    if r.is_err() {
+                        warn!(
+                            deadline_secs = DEMO_CYCLE_DEADLINE.as_secs(),
+                            "Demo cycle exceeded its deadline; leases will expire and requeue"
+                        );
+                    }
+                }
+                () = &mut shutdown => break,
+            }
         }
 
         let sleep = interval + portal_daemon::jitter(interval / 10);
@@ -504,7 +705,6 @@ async fn enrich_cycle(
     gc: &mut Cs2GcClient,
     game_slug: &str,
     batch_size: i64,
-    skip_demo_rank: bool,
 ) -> Result<(), CycleError> {
     let pending = portal
         .get_pending_matches(game_slug, batch_size)
@@ -569,63 +769,19 @@ async fn enrich_cycle(
                     .and_then(|mi| mi.demo.as_ref())
                     .and_then(|d| d.download_url());
 
-                // Attempt to download demo and extract rank data + metadata
-                let (player_ratings, map_name) = if !skip_demo_rank {
-                    if let Some(ref url) = demo_url {
-                        match download_and_extract_demo(&portal.http, url).await {
-                            Ok(extraction) => {
-                                let entries: Vec<PlayerRatingEntry> = extraction
-                                    .ranks
-                                    .into_iter()
-                                    .map(|r| PlayerRatingEntry {
-                                        account_id: r.account_id,
-                                        rank_id: r.rank_id,
-                                        rank_type_id: r.rank_type_id,
-                                        wins: r.wins,
-                                        rank_change: r.rank_change,
-                                    })
-                                    .collect();
-                                // "empty" is a real third outcome: casual/DM
-                                // demos parse fine but carry no rank updates.
-                                let outcome = if entries.is_empty() { "empty" } else { "ok" };
-                                metrics::counter!(
-                                    "cs2_enricher_rank_extractions_total",
-                                    "outcome" => outcome
-                                )
-                                .increment(1);
-                                let ratings = if entries.is_empty() {
-                                    None
-                                } else {
-                                    Some(entries)
-                                };
-                                (ratings, extraction.map_name)
-                            }
-                            Err(e) => {
-                                metrics::counter!(
-                                    "cs2_enricher_rank_extractions_total",
-                                    "outcome" => "error"
-                                )
-                                .increment(1);
-                                warn!(
-                                    match_id = %m.id,
-                                    error = %e,
-                                    "Demo extraction failed, submitting without ratings"
-                                );
-                                (None, None)
-                            }
-                        }
-                    } else {
-                        (None, None)
-                    }
-                } else {
-                    (None, None)
-                };
-
+                // The demo is deliberately NOT fetched here. Recording the URL
+                // is what opens the demo stage on the portal side, and
+                // `demo_cycle` drains that stage with its own budget, its own
+                // backoff and a durable attempt count.
+                //
+                // Doing it inline is what lost data in production: a demo Valve
+                // had not published yet failed its one and only attempt, the
+                // match was written as `enriched` with no ratings and no map
+                // name, and nothing anywhere recorded that it should ever be
+                // tried again.
                 info!(
                     match_id = %m.id,
                     has_demo = demo_url.is_some(),
-                    has_ratings = player_ratings.is_some(),
-                    map_name = ?map_name,
                     match_count = matches.len(),
                     "Got GC data, submitting enriched result"
                 );
@@ -636,8 +792,8 @@ async fn enrich_cycle(
                         &EnrichedMatchRequest {
                             gc_data: &matches,
                             demo_url,
-                            player_ratings,
-                            map_name,
+                            player_ratings: None,
+                            map_name: None,
                         },
                     )
                     .await
@@ -683,4 +839,104 @@ async fn enrich_cycle(
     }
 
     Ok(())
+}
+
+/// Drain a batch of demo-extraction jobs.
+///
+/// Independent of the GC session on purpose: a demo download needs no GC, so a
+/// dead or reconnecting session must not stop demos being fetched, and a slow
+/// CDN must not eat into the GC's rate-limited budget.
+///
+/// Errors are per-job and never propagate — a portal round trip that fails
+/// leaves the row leased, and the lease expiring is exactly the recovery path
+/// that already exists for a crashed worker.
+async fn demo_cycle(portal: &PortalClient, game_slug: &str, limit: i64) {
+    let jobs = match portal.lease_demo_jobs(game_slug, limit).await {
+        Ok(j) => j,
+        Err(e) => {
+            error!("Failed to lease demo jobs: {e}");
+            return;
+        }
+    };
+
+    metrics::gauge!("cs2_enricher_demo_jobs_leased").set(jobs.len() as f64);
+
+    if jobs.is_empty() {
+        return;
+    }
+
+    info!(count = jobs.len(), "Leased demo extraction jobs");
+
+    for job in &jobs {
+        info!(
+            match_id = %job.id,
+            share_code = %job.share_code,
+            attempt = job.attempt,
+            max = job.max_attempts,
+            "Attempting demo extraction"
+        );
+
+        let started = tokio::time::Instant::now();
+        let attempt = attempt_demo_extraction(&portal.http, &job.demo_url).await;
+        metrics::histogram!("cs2_enricher_demo_attempt_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+        metrics::counter!(
+            "cs2_enricher_demo_attempts_total",
+            "outcome" => attempt.outcome(),
+        )
+        .increment(1);
+
+        let request = match attempt {
+            DemoAttempt::Succeeded { ranks, map_name } => DemoResultRequest {
+                outcome: "succeeded",
+                error: None,
+                player_ratings: Some(
+                    ranks
+                        .into_iter()
+                        .map(|r| PlayerRatingEntry {
+                            account_id: r.account_id,
+                            rank_id: r.rank_id,
+                            rank_type_id: r.rank_type_id,
+                            wins: r.wins,
+                            rank_change: r.rank_change,
+                        })
+                        .collect(),
+                ),
+                map_name,
+            },
+            DemoAttempt::Empty { map_name } => DemoResultRequest {
+                outcome: "empty",
+                error: None,
+                player_ratings: None,
+                map_name,
+            },
+            ref failure @ (DemoAttempt::Unavailable(ref error)
+            | DemoAttempt::Failed(ref error)
+            | DemoAttempt::Gone(ref error)) => {
+                // Not an error log: "the demo is not up yet" is the expected
+                // state for a match that just ended, and the portal decides
+                // whether it is worth another attempt.
+                warn!(
+                    match_id = %job.id,
+                    attempt = job.attempt,
+                    max = job.max_attempts,
+                    outcome = failure.outcome(),
+                    error,
+                    "Demo attempt did not produce ranks"
+                );
+                DemoResultRequest {
+                    outcome: failure.outcome(),
+                    error: Some(error.clone()),
+                    player_ratings: None,
+                    map_name: None,
+                }
+            }
+        };
+
+        if let Err(e) = portal.submit_demo_result(&job.id, &request).await {
+            // The row stays leased; it becomes eligible again when the lease
+            // expires, having already spent this attempt.
+            error!(match_id = %job.id, "Failed to report demo result: {e}");
+        }
+    }
 }
