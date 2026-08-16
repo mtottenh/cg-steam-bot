@@ -5,11 +5,19 @@ After=network-online.target
 Wants=network-online.target
 # Frees GUARD_ADDR (the code-entry port, so the SAME ts.net:8443 page URL
 # serves the linking flow) and prevents two concurrent Steam logins on the
-# bot account. OnSuccess/OnFailure bring the enricher back either way, so
-# a finished or failed linking run never leaves enrichment stopped.
+# bot account.
 Conflicts=cs2-enricher.service
 After=cs2-enricher.service
-OnSuccess=cs2-enricher.service
+# Only FAILURE brings the enricher back automatically: a failed link changed
+# nothing about the account, so resuming enrichment is safe.
+#
+# Success deliberately leaves the enricher DOWN. A fresh authenticator means
+# Steam now demands a TOTP device code, and the secret to answer it has only
+# just been minted — it cannot be in the vault yet. Restarting here puts the
+# bot into a login loop it cannot win, and those attempts throttle the
+# account (RateLimitExceeded → AccountLoginDeniedThrottle), which costs far
+# more downtime than the manual start does. Start it after deploying the
+# secret; the run's final notice says so.
 OnFailure=cs2-enricher.service
 
 [Service]
@@ -21,10 +29,13 @@ Group=portal
 WorkingDirectory=/var/lib/portal
 # Reuses the enricher's credentials and GUARD_ADDR.
 EnvironmentFile=/etc/portal/cs2-enricher.env
-# Same machine-token cache as the enricher: the login performed here also
-# seeds the token that lets the enricher skip 2FA afterwards.
-CacheDirectory=portal-steam-bot
-Environment=XDG_CACHE_HOME=/var/cache/portal-steam-bot
+# NO machine-token cache here, deliberately. This tool no longer logs in
+# over the CM: it needs a mobile-platform session for AddAuthenticator, so
+# it runs its own WebAPI login (see mobile.rs) and never touches
+# steam-vent's FileGuardDataStore. It therefore cannot seed the enricher's
+# token, and pointing XDG_CACHE_HOME here would only imply otherwise. The
+# enricher answers its own guard challenge with the TOTP secret this run
+# produces.
 Environment=HOME=/var/lib/portal
 # The <account>.maFile (shared secret + revocation code, mode 0600) lands
 # here. Copy the shared secret into the vault after a successful run.

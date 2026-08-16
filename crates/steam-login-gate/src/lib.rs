@@ -10,12 +10,13 @@ use portal_daemon::GuardGate;
 use std::sync::Arc;
 use std::time::Duration;
 use steam_vent::auth::{
+    AuthConfirmationHandler, ConfirmationAction, ConfirmationMethod,
     ConsoleAuthConfirmationHandler, FileGuardDataStore, SharedSecretAuthConfirmationHandler,
     UserProvidedAuthConfirmationHandler,
 };
 use steam_vent::{Connection, ConnectionError, ServerList};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Default park time for a challenged login. Steam's auth session itself
 /// expires after a few minutes, so waiting longer only hides the retry.
@@ -83,6 +84,91 @@ pub fn remote_guard_handler(
     (handler, feeder)
 }
 
+/// Wraps a confirmation handler so the login's decision points reach the
+/// journal.
+///
+/// Without this the confirmation exchange is a black box: steam-vent logs
+/// `starting credentials login` and then either a `Connection` or an error,
+/// with nothing in between. That leaves the two questions you actually ask
+/// when a bot cannot log in unanswerable — did Steam even get as far as
+/// issuing a challenge, and did our handler have an answer for what it
+/// offered? A login rejected before the challenge and a TOTP code rejected
+/// after it look identical from outside, and they need opposite fixes.
+///
+/// Codes themselves are never logged; only which *kind* of challenge was
+/// offered and answered.
+pub struct LoggedConfirmationHandler<H> {
+    inner: H,
+    /// Which branch of [`login`] produced `inner`.
+    handler: &'static str,
+    account: String,
+}
+
+impl<H> LoggedConfirmationHandler<H> {
+    pub fn new(inner: H, handler: &'static str, account: &str) -> Self {
+        Self {
+            inner,
+            handler,
+            account: account.to_string(),
+        }
+    }
+}
+
+impl<H: AuthConfirmationHandler + Send> AuthConfirmationHandler for LoggedConfirmationHandler<H> {
+    async fn handle_confirmation(
+        self,
+        allowed_confirmations: &[ConfirmationMethod],
+    ) -> Option<ConfirmationAction> {
+        let offered: Vec<String> = allowed_confirmations
+            .iter()
+            .map(|m| match m.token_type() {
+                Some(token) => format!("{:?}/{token:?}", m.class()),
+                None => format!("{:?}", m.class()),
+            })
+            .collect();
+        let details: Vec<&str> = allowed_confirmations
+            .iter()
+            .map(ConfirmationMethod::confirmation_details)
+            .filter(|d| !d.is_empty())
+            .collect();
+        info!(
+            account = %self.account,
+            handler = self.handler,
+            offered = ?offered,
+            details = ?details,
+            "Steam Guard challenge offered — reached the confirmation phase"
+        );
+
+        let handler = self.handler;
+        let account = self.account;
+        let action = self.inner.handle_confirmation(allowed_confirmations).await;
+        match &action {
+            Some(ConfirmationAction::GuardToken(_, token_type)) => info!(
+                account = %account,
+                handler,
+                ?token_type,
+                "answered the challenge with a guard token"
+            ),
+            Some(other) => info!(
+                account = %account,
+                handler,
+                action = ?other,
+                "challenge needs no code from us"
+            ),
+            // Steam offered nothing this handler can answer — e.g. a TOTP
+            // secret against an email-code-only challenge. The login fails
+            // next, and without this line it fails for no visible reason.
+            None => warn!(
+                account = %account,
+                handler,
+                offered = ?offered,
+                "handler cannot satisfy any offered confirmation — the login will now fail"
+            ),
+        }
+        action
+    }
+}
+
 /// Log in to Steam, answering any Steam Guard challenge with (in order of
 /// preference) the TOTP `shared_secret`, the guard page `gate`, or a
 /// console prompt. Machine tokens persist via the user cache
@@ -98,27 +184,58 @@ pub async fn login(
 ) -> Result<Connection, ConnectionError> {
     let guard_data = FileGuardDataStore::user_cache();
 
+    // Which branch runs is the first thing you need to know when a login
+    // misbehaves, and it was previously invisible — an unattended TOTP login
+    // and one silently waiting on a guard page logged identically.
     if let Some(secret) = shared_secret {
+        info!(
+            account = %username,
+            "login using the TOTP shared secret (no guard page, no prompt)"
+        );
         Connection::login(
             server_list,
             username,
             password,
             guard_data,
-            SharedSecretAuthConfirmationHandler::new(secret),
+            LoggedConfirmationHandler::new(
+                SharedSecretAuthConfirmationHandler::new(secret),
+                "shared-secret",
+                username,
+            ),
         )
         .await
     } else if let Some(gate) = gate {
+        warn!(
+            account = %username,
+            wait_secs = code_wait.as_secs(),
+            "no shared secret configured — a challenge will park on the guard page"
+        );
         let (handler, feeder) =
             remote_guard_handler(Arc::clone(gate), username.to_string(), code_wait);
         tokio::spawn(feeder);
-        Connection::login(server_list, username, password, guard_data, handler).await
-    } else {
         Connection::login(
             server_list,
             username,
             password,
             guard_data,
-            ConsoleAuthConfirmationHandler::default(),
+            LoggedConfirmationHandler::new(handler, "guard-page", username),
+        )
+        .await
+    } else {
+        warn!(
+            account = %username,
+            "no shared secret and no guard page — a challenge will block on the console"
+        );
+        Connection::login(
+            server_list,
+            username,
+            password,
+            guard_data,
+            LoggedConfirmationHandler::new(
+                ConsoleAuthConfirmationHandler::default(),
+                "console",
+                username,
+            ),
         )
         .await
     }
@@ -132,6 +249,51 @@ mod tests {
     use steam_vent::proto::steammessages_auth_steamclient::{
         CAuthentication_AllowedConfirmation, EAuthSessionGuardType,
     };
+
+    /// base64 of "12345678901234567890" — 20 bytes, the length Steam issues.
+    const TEST_SECRET: &str = "MTIzNDU2Nzg5MDEyMzQ1Njc4OTA=";
+
+    fn offered(guard_type: EAuthSessionGuardType) -> [ConfirmationMethod; 1] {
+        let mut method = CAuthentication_AllowedConfirmation::new();
+        method.set_confirmation_type(guard_type);
+        [method.into()]
+    }
+
+    /// The logging wrapper must be a pure observer: same action out as the
+    /// handler it wraps, for both the answerable and unanswerable cases.
+    /// A diagnostic that changes the behaviour it reports is worse than none.
+    #[tokio::test]
+    async fn logging_wrapper_is_transparent() {
+        let device_code = offered(EAuthSessionGuardType::k_EAuthSessionGuardType_DeviceCode);
+        let bare = SharedSecretAuthConfirmationHandler::new(TEST_SECRET)
+            .handle_confirmation(&device_code)
+            .await;
+        let wrapped = LoggedConfirmationHandler::new(
+            SharedSecretAuthConfirmationHandler::new(TEST_SECRET),
+            "shared-secret",
+            "bot",
+        )
+        .handle_confirmation(&device_code)
+        .await;
+        assert!(matches!(bare, Some(ConfirmationAction::GuardToken(_, _))));
+        assert!(matches!(
+            wrapped,
+            Some(ConfirmationAction::GuardToken(_, _))
+        ));
+
+        // A TOTP secret cannot answer an out-of-band confirmation; the
+        // wrapper must still report None rather than inventing an action.
+        let confirmation =
+            offered(EAuthSessionGuardType::k_EAuthSessionGuardType_DeviceConfirmation);
+        let wrapped_none = LoggedConfirmationHandler::new(
+            SharedSecretAuthConfirmationHandler::new(TEST_SECRET),
+            "shared-secret",
+            "bot",
+        )
+        .handle_confirmation(&confirmation)
+        .await;
+        assert!(wrapped_none.is_none());
+    }
 
     /// Drives the duplex bridge end to end: steam-vent's handler writes its
     /// prompt, the feeder arms the gate, a code submitted through the gate

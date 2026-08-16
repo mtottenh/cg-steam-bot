@@ -2431,10 +2431,11 @@ dependencies = [
  "hmac",
  "portal-daemon",
  "rand 0.9.2",
+ "reqwest",
  "rpassword",
+ "rsa",
  "serde_json",
  "sha1",
- "steam-login-gate",
  "steam-vent",
  "tokio",
  "tracing",
@@ -2458,6 +2459,7 @@ dependencies = [
  "base64",
  "clap",
  "hmac",
+ "serde_json",
  "sha1",
 ]
 

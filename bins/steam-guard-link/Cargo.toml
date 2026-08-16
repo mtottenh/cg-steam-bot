@@ -7,8 +7,11 @@ description = "One-shot Steam mobile authenticator linker driven through the gua
 
 [dependencies]
 portal-daemon = { path = "../../crates/portal-daemon" }
-steam-login-gate = { path = "../../crates/steam-login-gate" }
 steam-vent.workspace = true
+reqwest.workspace = true
+# Steam encrypts the login password with the RSA key it hands out; the
+# version tracks steam-vent-crypto's so the workspace resolves one copy.
+rsa = "0.9"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
