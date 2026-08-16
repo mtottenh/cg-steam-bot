@@ -115,7 +115,12 @@ async fn call<Req: Message, Resp: Message>(
     // EResult 1 is OK; a missing header on a 2xx also means success.
     match eresult {
         Some(1) | None if http_status.is_success() => {}
-        Some(code) => return Err(Box::new(ApiRefusal { eresult: code, message })),
+        Some(code) => {
+            return Err(Box::new(ApiRefusal {
+                eresult: code,
+                message,
+            }))
+        }
         None => return Err(format!("WebAPI {path} failed with HTTP {http_status}").into()),
     }
     Ok(Resp::parse_from_bytes(&body)?)
@@ -123,7 +128,10 @@ async fn call<Req: Message, Resp: Message>(
 
 /// Steam's login RSA key, as a usable public key plus the timestamp that
 /// must accompany the encrypted password.
-async fn password_key(client: &reqwest::Client, account: &str) -> Result<(RsaPublicKey, u64), Error> {
+async fn password_key(
+    client: &reqwest::Client,
+    account: &str,
+) -> Result<(RsaPublicKey, u64), Error> {
     let mut req = CAuthentication_GetPasswordRSAPublicKey_Request::new();
     req.set_account_name(account.to_string());
     let resp: CAuthentication_GetPasswordRSAPublicKey_Response = call(
@@ -139,10 +147,7 @@ async fn password_key(client: &reqwest::Client, account: &str) -> Result<(RsaPub
         .ok_or("Steam returned an unparsable RSA modulus")?;
     let exponent = BigUint::parse_bytes(resp.publickey_exp().as_bytes(), 16)
         .ok_or("Steam returned an unparsable RSA exponent")?;
-    Ok((
-        RsaPublicKey::new(modulus, exponent)?,
-        resp.timestamp(),
-    ))
+    Ok((RsaPublicKey::new(modulus, exponent)?, resp.timestamp()))
 }
 
 impl MobileSession {
@@ -292,7 +297,8 @@ impl MobileSession {
     /// clock matters more than the absolute value.
     pub async fn server_time(&self) -> Result<u64, Error> {
         let resp: steam_vent::proto::steammessages_twofactor_steamclient::CTwoFactor_Time_Response =
-            self.two_factor("QueryTime", &CTwoFactor_Time_Request::new()).await?;
+            self.two_factor("QueryTime", &CTwoFactor_Time_Request::new())
+                .await?;
         Ok(resp.server_time())
     }
 }

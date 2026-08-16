@@ -993,7 +993,10 @@ mod tests {
     /// the header, not as a `LoginError` — it must not be filed as "network".
     #[test]
     fn login_throttles_classify_as_rate_limit() {
-        for result in [EResult::RateLimitExceeded, EResult::AccountLoginDeniedThrottle] {
+        for result in [
+            EResult::RateLimitExceeded,
+            EResult::AccountLoginDeniedThrottle,
+        ] {
             let e = ConnectionError::Network(NetworkError::ApiError(result));
             assert_eq!(classify_logon_failure(&e), "rate-limit", "{result:?}");
         }

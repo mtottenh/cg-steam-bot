@@ -402,11 +402,13 @@ async fn preflight(session: &MobileSession, steam_id: u64) -> Result<(), Error> 
     );
 
     if st.has_authenticator_allowed() && !st.authenticator_allowed() {
-        return Err("Steam reports authenticator_allowed=false for this account — it will \
+        return Err(
+            "Steam reports authenticator_allowed=false for this account — it will \
                     refuse AddAuthenticator. This is normally a missing/unconfirmed phone \
                     number: add one at https://store.steampowered.com/phone/manage, then \
                     re-run."
-            .into());
+                .into(),
+        );
     }
     if st.authenticator_type() != 0 {
         return Err(format!(

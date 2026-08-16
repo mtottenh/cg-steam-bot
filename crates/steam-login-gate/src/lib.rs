@@ -276,7 +276,10 @@ mod tests {
         .handle_confirmation(&device_code)
         .await;
         assert!(matches!(bare, Some(ConfirmationAction::GuardToken(_, _))));
-        assert!(matches!(wrapped, Some(ConfirmationAction::GuardToken(_, _))));
+        assert!(matches!(
+            wrapped,
+            Some(ConfirmationAction::GuardToken(_, _))
+        ));
 
         // A TOTP secret cannot answer an out-of-band confirmation; the
         // wrapper must still report None rather than inventing an action.
