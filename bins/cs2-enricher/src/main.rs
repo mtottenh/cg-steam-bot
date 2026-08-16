@@ -13,7 +13,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use steam_vent::{ConnectionError, LoginError, ServerList};
+use steam_vent::{ConnectionError, LoginError, NetworkError, ServerList};
 use tracing::{error, info, warn};
 
 /// CS2 match enricher bot.
@@ -282,7 +282,7 @@ fn classify_logon_failure(e: &(dyn std::error::Error + 'static)) -> &'static str
                 LoginError::RateLimited => "rate-limit",
                 _ => "login-other",
             },
-            ConnectionError::Network(_) => "network",
+            ConnectionError::Network(net) => classify_network_failure(net),
             // The guard gate aborts the login when no code arrives in time;
             // the next reconnect pass re-arms the code-entry page.
             ConnectionError::Aborted => "guard-timeout",
@@ -293,6 +293,29 @@ fn classify_logon_failure(e: &(dyn std::error::Error + 'static)) -> &'static str
         return "gc-handshake";
     }
     "other"
+}
+
+/// Steam reports most login refusals as an EResult on the message header,
+/// not as a [`LoginError`] — steam-vent surfaces those as
+/// `Network(ApiError(..))`, so matching only on `LoginError` files a
+/// throttle under "network" and leaves the rate-limit series flat during
+/// exactly the incident it exists to catch. Reasons here must agree with
+/// the `LoginError` arm above: the same condition cannot have two names.
+fn classify_network_failure(e: &NetworkError) -> &'static str {
+    let NetworkError::ApiError(result) = e else {
+        return "network";
+    };
+    match *result as i32 {
+        // RateLimitExceeded, then AccountLoginDeniedThrottle once Steam
+        // escalates. Both mean the same thing: stop logging in and wait.
+        84 | 87 => "rate-limit",
+        // Guard needed but unmet — a missing/incorrect shared secret, or a
+        // code prompt nobody answered.
+        63 | 85 => "steam-guard",
+        5 => "bad-creds",
+        51 => "suspended",
+        _ => "network",
+    }
 }
 
 async fn connect_gc(
@@ -524,6 +547,15 @@ const DEMO_ATTEMPT_DURATION_BUCKETS: &[f64] =
 /// Reconnect backoff bounds for the GC session.
 const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Flat wait when Steam says we are logging in too often.
+///
+/// A throttle is not a transport blip: climbing the ordinary ladder from
+/// 5 s spends a dozen login attempts inside the window Steam wants quiet,
+/// which is how `RateLimitExceeded` escalates into
+/// `AccountLoginDeniedThrottle` and turns a short cooldown into a long one.
+/// Hold flat and long instead — the failure mode of waiting too long is a
+/// late recovery, and of waiting too little, no recovery at all.
+const RECONNECT_BACKOFF_RATE_LIMITED: Duration = Duration::from_secs(900);
 
 #[tokio::main]
 async fn main() {
@@ -598,16 +630,27 @@ async fn main() {
                     metrics::gauge!("cs2_enricher_gc_session_up").set(0.0);
                     metrics::counter!("cs2_enricher_logon_failures_total", "reason" => reason)
                         .increment(1);
+                    let rate_limited = reason == "rate-limit";
+                    let wait = if rate_limited {
+                        RECONNECT_BACKOFF_RATE_LIMITED
+                    } else {
+                        backoff
+                    };
                     error!(
                         reason,
-                        backoff_secs = backoff.as_secs(),
+                        backoff_secs = wait.as_secs(),
                         "Failed to connect to Steam GC: {e}"
                     );
                     tokio::select! {
-                        () = tokio::time::sleep(backoff) => {}
+                        () = tokio::time::sleep(wait) => {}
                         () = &mut shutdown => break,
                     }
-                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    // A throttle holds flat at its own floor; only the
+                    // ordinary ladder climbs, and it keeps its own position
+                    // so a cleared throttle does not inherit a 15 min wait.
+                    if !rate_limited {
+                        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    }
                     continue;
                 }
             }
@@ -938,5 +981,53 @@ async fn demo_cycle(portal: &PortalClient, game_slug: &str, limit: i64) {
             // expires, having already spent this attempt.
             error!(match_id = %job.id, "Failed to report demo result: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use steam_vent::EResult;
+
+    /// The throttle that actually took the bot down arrives as an EResult on
+    /// the header, not as a `LoginError` — it must not be filed as "network".
+    #[test]
+    fn login_throttles_classify_as_rate_limit() {
+        for result in [EResult::RateLimitExceeded, EResult::AccountLoginDeniedThrottle] {
+            let e = ConnectionError::Network(NetworkError::ApiError(result));
+            assert_eq!(classify_logon_failure(&e), "rate-limit", "{result:?}");
+        }
+    }
+
+    #[test]
+    fn guard_and_credential_eresults_keep_their_own_names() {
+        let cases = [
+            (EResult::AccountLoginDeniedNeedTwoFactor, "steam-guard"),
+            (EResult::AccountLogonDenied, "steam-guard"),
+            (EResult::InvalidPassword, "bad-creds"),
+            (EResult::Suspended, "suspended"),
+        ];
+        for (result, expected) in cases {
+            let e = ConnectionError::Network(NetworkError::ApiError(result));
+            assert_eq!(classify_logon_failure(&e), expected, "{result:?}");
+        }
+    }
+
+    /// Transport failures with no EResult stay "network", and the
+    /// `LoginError` arm keeps working — the new arm must not shadow it.
+    #[test]
+    fn non_eresult_failures_are_unchanged() {
+        assert_eq!(
+            classify_logon_failure(&ConnectionError::Network(NetworkError::Timeout)),
+            "network"
+        );
+        assert_eq!(
+            classify_logon_failure(&ConnectionError::LoginError(LoginError::InvalidCredentials)),
+            "bad-creds"
+        );
+        assert_eq!(
+            classify_logon_failure(&ConnectionError::Aborted),
+            "guard-timeout"
+        );
     }
 }
