@@ -1,6 +1,6 @@
 [package]
 name = "cs2-enricher"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "CS2 match enricher bot — fetches full match data from the Game Coordinator"
