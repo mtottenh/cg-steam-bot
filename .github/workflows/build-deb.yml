@@ -57,10 +57,10 @@ jobs:
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
 
-      # The deb (portal-steam-bot) ships three release binaries — build all,
+      # The deb (portal-steam-bot) ships four release binaries — build all,
       # then package without rebuilding. Mirrors the documented deploy command.
       - name: Build release binaries
-        run: cargo build --release --locked -p cs2-poller -p cs2-enricher -p steam-guard-link
+        run: cargo build --release --locked -p cs2-poller -p cs2-enricher -p steam-guard-link -p steam-totp
 
       - name: Build deb
         run: cargo deb -p cs2-enricher --no-build
@@ -104,6 +104,10 @@ jobs:
           test -x /usr/bin/cs2-poller
           test -x /usr/bin/cs2-enricher
           test -x /usr/bin/steam-guard-link
+          test -x /usr/bin/steam-totp
+          # Generates a code from a known 20-byte secret — catches a
+          # steam-totp that ships but cannot actually produce a code.
+          steam-totp --secret "MTIzNDU2Nzg5MDEyMzQ1Njc4OTA=" | grep -Eq "^[23456789BCDFGHJKMNPQRTVWXY]{5}  \([0-9]+s remaining\)$"
           getent passwd portal
           sudo test -f /etc/portal/cs2-poller.env
           sudo test -f /etc/portal/cs2-enricher.env

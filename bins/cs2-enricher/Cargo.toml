@@ -29,11 +29,15 @@ rayon.workspace = true
 # relative to THIS crate's dir (bins/cs2-enricher/), hence dist/ lives here;
 # target/release/ is special-cased to the workspace target dir. Build:
 #
-#   cargo build --release -p cs2-poller -p cs2-enricher -p steam-guard-link
+#   cargo build --release -p cs2-poller -p cs2-enricher -p steam-guard-link \
+#     -p steam-totp
 #   cargo deb -p cs2-enricher --no-build
 #
-# The dev-only bins (cs2-matches, demo-downloader, steam-totp) are NOT
-# shipped. steam-guard-link (one-shot authenticator bootstrap) IS shipped,
+# The dev-only bins (cs2-matches, demo-downloader) are NOT shipped.
+# steam-totp IS shipped: once the bot account has an authenticator, logging
+# in as it by hand (support, recovery, verifying the deployed secret) needs
+# a code from the same shared secret, and the box is the only place that
+# secret lives. steam-guard-link (one-shot authenticator bootstrap) IS shipped,
 # with its unit installed as a PLAIN ASSET (not via systemd-units): it is
 # started manually, never enabled at boot — cargo-deb's systemd integration
 # would enable+start it, which is exactly wrong for a one-shot interactive
@@ -63,6 +67,7 @@ assets = [
     ["target/release/cs2-poller", "usr/bin/cs2-poller", "755"],
     ["target/release/cs2-enricher", "usr/bin/cs2-enricher", "755"],
     ["target/release/steam-guard-link", "usr/bin/steam-guard-link", "755"],
+    ["target/release/steam-totp", "usr/bin/steam-totp", "755"],
     ["dist/cs2-poller.env.example", "etc/portal/cs2-poller.env.example", "0644"],
     ["dist/cs2-enricher.env.example", "etc/portal/cs2-enricher.env.example", "0644"],
     ["dist/steam-guard-link.service", "usr/lib/systemd/system/steam-guard-link.service", "0644"],
