@@ -1,11 +1,17 @@
 //! One-shot Steam mobile authenticator linker.
 //!
-//! Links a mobile authenticator to the bot account entirely over the CM
-//! connection (`TwoFactor.AddAuthenticator` / `FinalizeAddAuthenticator`),
-//! driving every interactive step — the login's email code and the SMS
-//! activation code — through the portal-daemon Steam Guard page. The whole
-//! bootstrap works from a browser on the tailnet: no SSH session, no
-//! desktop tools, and the shared secret is born on the box.
+//! Links a mobile authenticator to the bot account
+//! (`TwoFactor.AddAuthenticator` / `FinalizeAddAuthenticator`), driving
+//! every interactive step — the login's email code and the SMS activation
+//! code — through the portal-daemon Steam Guard page. The whole bootstrap
+//! works from a browser on the tailnet: no SSH session, no desktop tools,
+//! and the shared secret is born on the box.
+//!
+//! Unlike the bots, this tool does NOT log in through `steam-login-gate`'s
+//! CM connection: Steam only accepts `AddAuthenticator` from a mobile
+//! session, and steam-vent hard-codes the SteamClient platform type with no
+//! override. The login and the two-factor calls therefore go over the
+//! WebAPI with mobile device details — see [`mobile`].
 //!
 //! ## Usage
 //!
@@ -37,10 +43,12 @@ use steam_vent::proto::protobuf::UnknownValueRef;
 use steam_vent::proto::steammessages_twofactor_steamclient::{
     CTwoFactor_AddAuthenticator_Request, CTwoFactor_AddAuthenticator_Response,
     CTwoFactor_FinalizeAddAuthenticator_Request, CTwoFactor_FinalizeAddAuthenticator_Response,
-    CTwoFactor_Time_Request,
+    CTwoFactor_Status_Request, CTwoFactor_Status_Response,
 };
-use steam_vent::{Connection, ConnectionTrait, ServerList};
 use tracing::{error, info, warn};
+
+mod mobile;
+use mobile::{ApiRefusal, MobileSession};
 
 type Error = Box<dyn std::error::Error>;
 
@@ -149,28 +157,23 @@ async fn run(args: &Args, page_enabled: bool, gate: &Arc<GuardGate>) -> Result<(
         args.username
     ));
 
-    info!("Discovering Steam CM servers...");
-    let server_list = ServerList::discover().await?;
-
-    info!(username = %args.username, "Logging in to Steam...");
-    let connection = steam_login_gate::login(
-        &server_list,
-        &args.username,
-        &password,
-        None,
-        prompt_gate,
-        CODE_WAIT,
-    )
+    // Deliberately NOT the shared steam_login_gate/CM path the bots use:
+    // Steam only accepts AddAuthenticator from a mobile session, and
+    // steam-vent hard-codes the SteamClient platform type. See mobile.rs.
+    info!(username = %args.username, "Logging in to Steam as the mobile app...");
+    let session = MobileSession::login(&args.username, &password, |prompt| {
+        let account = args.username.clone();
+        async move { prompt_code(prompt_gate, &account, &prompt).await }
+    })
     .await?;
-    let steam_id = u64::from(connection.steam_id());
+    let steam_id = session.steam_id;
     info!(steam_id, "logged in");
 
     // TOTP codes are time-based — use Steam's clock, not ours.
-    let time_resp = connection
-        .service_method(CTwoFactor_Time_Request::new())
-        .await?;
-    let clock_offset = time_resp.server_time() as i64 - unix_now() as i64;
-    info!(clock_offset, "synced clock with TwoFactor.Time");
+    let clock_offset = session.server_time().await? as i64 - unix_now() as i64;
+    info!(clock_offset, "synced clock with TwoFactor.QueryTime");
+
+    preflight(&session, steam_id).await?;
 
     gate.set_notice(format!(
         "Logged in as {}. Requesting an authenticator from Steam…",
@@ -184,24 +187,13 @@ async fn run(args: &Args, page_enabled: bool, gate: &Arc<GuardGate>) -> Result<(
     add.set_authenticator_type(1);
     add.set_device_identifier(device_id.clone());
     add.set_version(2);
-    let added = connection.service_method(add).await?;
+    let added: CTwoFactor_AddAuthenticator_Response = session
+        .two_factor("AddAuthenticator", &add)
+        .await
+        .map_err(|e| -> Error { explain_refusal_error(e, explain_add_refusal) })?;
 
     if added.shared_secret().is_empty() {
-        return Err(match added.status() {
-            2 => "Steam refused (status 2): the account most likely has no phone number. \
-                  Add one at https://store.steampowered.com/phone/manage (works from any \
-                  browser), then run this again."
-                .to_string(),
-            29 => "Steam refused (status 29, DuplicateRequest): the account already has an \
-                   authenticator. Remove it first (revocation code via its maFile), or reuse \
-                   its existing shared secret instead of linking a new one."
-                .to_string(),
-            84 => "Steam refused (status 84, RateLimitExceeded): too many attempts — wait a \
-                   while (up to a day) and run this again."
-                .to_string(),
-            s => format!("Steam refused the AddAuthenticator request (status {s})."),
-        }
-        .into());
+        return Err(explain_add_refusal(added.status()).into());
     }
 
     let shared_secret = added.shared_secret().to_vec();
@@ -235,7 +227,7 @@ async fn run(args: &Args, page_enabled: bool, gate: &Arc<GuardGate>) -> Result<(
     ));
 
     finalize(
-        &connection,
+        &session,
         gate,
         prompt_gate,
         args,
@@ -257,6 +249,10 @@ async fn run(args: &Args, page_enabled: bool, gate: &Arc<GuardGate>) -> Result<(
     )?;
 
     let secret_b64 = base64::engine::general_purpose::STANDARD.encode(&shared_secret);
+    // Everything except the secret itself. The journal is shipped off-box
+    // (alloy tails every unit into Loki), so the shared secret must never be
+    // logged — it lives in the maFile, and on the tailnet-only guard page
+    // for as long as this process lingers.
     let summary = format!(
         "Authenticator LINKED and ACTIVE for {account}.\n\
          \n\
@@ -266,16 +262,161 @@ async fn run(args: &Args, page_enabled: bool, gate: &Arc<GuardGate>) -> Result<(
          \n\
          maFile: {path}\n\
          \n\
-         Shared secret (base64) for vault_steam_bot_shared_secret:\n\
-         {secret_b64}\n\
+         cs2-enricher is deliberately still STOPPED: the account now requires\n\
+         a TOTP code it cannot produce until the secret is deployed. Starting\n\
+         it before then only throttles the account.\n\
          \n\
-         Next: put the secret in the vault (just edit-vault), redeploy, and\n\
-         the enricher logs in unattended with TOTP from now on.",
+         Next:\n\
+         \x20 1. Read the shared secret out of the maFile:\n\
+         \x20    sudo jq -r .shared_secret {path}\n\
+         \x20 2. Put it in the vault as vault_steam_bot_shared_secret\n\
+         \x20    (just edit-vault) and redeploy.\n\
+         \x20 3. systemctl start cs2-enricher — it logs in with TOTP from\n\
+         \x20    now on.",
         account = args.username,
         path = mafile_path.display(),
     );
     info!("{summary}");
-    gate.set_notice(summary);
+    // The page gets the one extra line the journal must not carry.
+    gate.set_notice(format!(
+        "{summary}\n\
+         \n\
+         Shared secret (base64) for vault_steam_bot_shared_secret:\n\
+         {secret_b64}"
+    ));
+    Ok(())
+}
+
+/// The EResult behind a refusal, if the error is one.
+fn refusal_code(e: &Error) -> Option<i32> {
+    e.downcast_ref::<ApiRefusal>().map(|r| r.eresult)
+}
+
+/// Steam reports a refused two-factor call in one of two places: a
+/// `status` field in the response body, or an `x-eresult` header on the
+/// response. The numeric spaces are the same, so route both through one
+/// explainer rather than letting a header-borne refusal surface as an
+/// opaque transport error.
+fn explain_refusal_error(e: Error, explain: fn(i32) -> String) -> Error {
+    match refusal_code(&e) {
+        Some(code) => explain(code).into(),
+        None => e,
+    }
+}
+
+fn explain_add_refusal(code: i32) -> String {
+    match code {
+        2 => "Steam refused with Fail (2). This login is already a mobile session (see \
+              mobile.rs), so the usual platform-type cause is ruled out. What remains is the \
+              account itself: confirm it has a *verified* phone number at \
+              https://store.steampowered.com/phone/manage — Steam texts the activation code, \
+              so an unverified or recently-changed number is refused here."
+            .to_string(),
+        29 => "Steam refused with DuplicateRequest (29): the account already has an \
+               authenticator. Remove it first (revocation code via its maFile), or reuse \
+               its existing shared secret instead of linking a new one."
+            .to_string(),
+        84 => "Steam refused with RateLimitExceeded (84): too many attempts — wait a \
+               while (up to a day) and run this again."
+            .to_string(),
+        15 => "Steam refused with AccessDenied (15): the logged-in session is not allowed to \
+               add an authenticator to this account."
+            .to_string(),
+        s => format!("Steam refused the AddAuthenticator request (code {s})."),
+    }
+}
+
+/// Whether the account has a phone number attached.
+///
+/// This is the one prerequisite `TwoFactor.Status` cannot answer —
+/// `authenticator_allowed` is account eligibility, not phone presence —
+/// and a missing phone fails `AddAuthenticator` with the same bare `Fail`
+/// as a platform-type refusal. `IPhoneService` has no proto in
+/// steam-vent-proto-steam, so ask the WebAPI, which (unlike the CM path)
+/// hands back a readable body. Purely diagnostic: it logs what it finds
+/// and never fails the run, since the token we hold is a SteamClient one
+/// and Steam may decline to answer it.
+async fn phone_status(token: &str) {
+    let url = "https://api.steampowered.com/IPhoneService/AccountPhoneStatus/v1/";
+    let resp = reqwest::Client::new()
+        .get(url)
+        .query(&[("access_token", token), ("format", "json")])
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await;
+    let body = match resp {
+        Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
+        Ok(r) => {
+            warn!(status = %r.status(), "AccountPhoneStatus refused — phone presence unknown");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "AccountPhoneStatus unreachable — phone presence unknown");
+            return;
+        }
+    };
+
+    // Log the raw body too: the field set here is not covered by any proto
+    // we ship, so if `has_phone` ever moves this is what identifies it.
+    info!(body = %body.trim(), "IPhoneService.AccountPhoneStatus");
+    match serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["response"]["has_phone"].as_bool())
+    {
+        Some(true) => info!("account has a phone number — SMS activation can proceed"),
+        Some(false) => warn!(
+            "ACCOUNT HAS NO PHONE NUMBER — this alone makes Steam refuse AddAuthenticator, \
+             and the SMS activation code later in this flow has nowhere to go. Add one at \
+             https://store.steampowered.com/phone/manage, then re-run."
+        ),
+        None => warn!("could not read has_phone from the response — phone presence unknown"),
+    }
+}
+
+/// Ask Steam what it thinks of the account's two-factor state before
+/// requesting an authenticator. `AddAuthenticator` answers a refusal with
+/// a bare EResult, which is far too coarse to act on; `TwoFactor.Status`
+/// costs one round trip and names the actual blocker.
+async fn preflight(session: &MobileSession, steam_id: u64) -> Result<(), Error> {
+    phone_status(session.access_token()).await;
+
+    let mut req = CTwoFactor_Status_Request::new();
+    req.set_steamid(steam_id);
+    let st: CTwoFactor_Status_Response = match session.two_factor("QueryStatus", &req).await {
+        Ok(st) => st,
+        // Never block the attempt on the diagnostic itself.
+        Err(e) => {
+            warn!(error = %e, "TwoFactor.Status failed — continuing without a preflight");
+            return Ok(());
+        }
+    };
+
+    info!(
+        state = st.state(),
+        authenticator_type = st.authenticator_type(),
+        authenticator_allowed = st.authenticator_allowed(),
+        email_validated = st.email_validated(),
+        steamguard_scheme = st.steamguard_scheme(),
+        token_gid = %st.token_gid(),
+        "TwoFactor.Status"
+    );
+
+    if st.has_authenticator_allowed() && !st.authenticator_allowed() {
+        return Err("Steam reports authenticator_allowed=false for this account — it will \
+                    refuse AddAuthenticator. This is normally a missing/unconfirmed phone \
+                    number: add one at https://store.steampowered.com/phone/manage, then \
+                    re-run."
+            .into());
+    }
+    if st.authenticator_type() != 0 {
+        return Err(format!(
+            "Steam reports an existing authenticator (authenticator_type={}, token_gid={}). \
+             Remove it with its revocation code before linking a new one.",
+            st.authenticator_type(),
+            st.token_gid()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -286,7 +427,7 @@ async fn run(args: &Args, page_enabled: bool, gate: &Arc<GuardGate>) -> Result<(
 /// means the SMS activation code itself was wrong.
 #[allow(clippy::too_many_arguments)]
 async fn finalize(
-    connection: &Connection,
+    session: &MobileSession,
     gate: &Arc<GuardGate>,
     prompt_gate: Option<&Arc<GuardGate>>,
     args: &Args,
@@ -322,7 +463,24 @@ async fn finalize(
             fin.set_authenticator_code(totp_code(shared_secret, time));
             fin.set_authenticator_time(time);
             fin.set_validate_sms_code(true);
-            let resp = connection.service_method(fin).await?;
+            // 88/89 can arrive as an `x-eresult` header rather than a body
+            // status — normalise both shapes to a status.
+            let resp: CTwoFactor_FinalizeAddAuthenticator_Response =
+                match session.two_factor("FinalizeAddAuthenticator", &fin).await {
+                    Ok(resp) => resp,
+                    Err(e) => match refusal_code(&e) {
+                        Some(code @ (88 | 89)) => {
+                            let mut synth = CTwoFactor_FinalizeAddAuthenticator_Response::new();
+                            synth.set_status(code);
+                            synth
+                        }
+                        _ => {
+                            return Err(explain_refusal_error(e, |s| {
+                                format!("FinalizeAddAuthenticator failed (code {s}).")
+                            }))
+                        }
+                    },
+                };
 
             if resp.status() == 89 {
                 warn!("Steam rejected the SMS activation code (status 89)");
@@ -591,6 +749,33 @@ mod tests {
             assert_eq!(mode, 0o600, "maFile must not be world-readable");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A refusal delivered as an `x-eresult` header must produce the same
+    /// actionable text as the equivalent body status, and anything that is
+    /// not a refusal must pass through untouched rather than being
+    /// misreported as one.
+    #[test]
+    fn header_eresult_and_body_status_explain_alike() {
+        for code in [2, 15, 29, 84] {
+            let refusal: Error = Box::new(ApiRefusal {
+                eresult: code,
+                message: None,
+            });
+            assert_eq!(
+                explain_refusal_error(refusal, explain_add_refusal).to_string(),
+                explain_add_refusal(code),
+            );
+        }
+        assert!(explain_add_refusal(2).contains("phone"));
+        assert!(explain_add_refusal(29).contains("already has an authenticator"));
+
+        let transport: Error = "connection reset".into();
+        assert_eq!(
+            explain_refusal_error(transport, explain_add_refusal).to_string(),
+            "connection reset",
+        );
+        assert_eq!(refusal_code(&"connection reset".into()), None);
     }
 
     #[test]
