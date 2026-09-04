@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use cs2_demo_rank::RankUpdate;
-use cs2_gc::{Cs2GcClient, GcTransportError};
+use cs2_gc::Cs2GcClient;
 use parallel_bzip2_decoder::{decompress_block, scan_blocks};
 use portal_daemon::GuardGate;
 use rayon::prelude::*;
@@ -674,7 +674,7 @@ async fn main() {
                         // Session-fatal: drop the client and reconnect next
                         // pass rather than failing every pending match.
                         metrics::gauge!("cs2_enricher_gc_session_up").set(0.0);
-                        metrics::counter!("cs2_enricher_gc_reconnects_total", "reason" => "stream-closed")
+                        metrics::counter!("cs2_enricher_gc_reconnects_total", "reason" => "session-fatal")
                             .increment(1);
                         warn!("GC session lost, reconnecting: {e}");
                         gc = None;
@@ -858,10 +858,18 @@ async fn enrich_cycle(
                     .record(enrich_start.elapsed().as_secs_f64());
             }
             Err(e) => {
-                // A closed GC stream is session death, not a bad match:
-                // reconnect instead of marking every pending match failed
-                // at batch_size per cycle (the old crash-the-budget bug).
-                if matches!(&e, cs2_gc::Error::Transport(GcTransportError::StreamClosed)) {
+                // Session death is not a bad match: reconnect instead of
+                // marking every pending match failed at batch_size per cycle
+                // (the old crash-the-budget bug).
+                //
+                // This used to test for `StreamClosed` alone, which is only
+                // the case where the GC channel ends while we WAIT. When the
+                // Steam websocket dies, the next *send* fails first, with
+                // "Trying to work with closed connection" — and every match in
+                // the batch was written off with that message, one retry
+                // budget at a time, until the queue was full of matches that
+                // had never actually been tried.
+                if e.is_session_fatal() {
                     return Err(CycleError::GcSession(e));
                 }
 

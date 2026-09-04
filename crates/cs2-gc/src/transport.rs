@@ -127,6 +127,51 @@ impl From<NetworkError> for GcTransportError {
     }
 }
 
+impl GcTransportError {
+    /// Whether this error means **the session is gone**, as opposed to this
+    /// particular request having failed.
+    ///
+    /// The distinction decides who pays for the error. A per-request failure
+    /// (a match Valve will not serve, a response that never arrives) is
+    /// charged to that match's retry budget. A dead session is charged to
+    /// nobody: the caller reconnects and tries the same work again.
+    ///
+    /// Getting this wrong is not cosmetic. Only `StreamClosed` used to count,
+    /// so when the underlying Steam websocket closed, every send failed with
+    /// `Network(Ws(AlreadyClosed))` — "Trying to work with closed connection"
+    /// — and the enricher wrote that string onto match after match as an
+    /// enrichment failure, burning each one's retry budget at batch size per
+    /// cycle. The pipeline looked broken because it was: a dead socket was
+    /// being blamed on the data.
+    #[must_use]
+    pub fn is_session_fatal(&self) -> bool {
+        match self {
+            // The GC message channel ended: the connection behind it is gone.
+            Self::StreamClosed => true,
+            // The GC refused this logon. Nothing we send will be answered
+            // until we log on again.
+            Self::LogonFatalError { .. } => true,
+            Self::HandshakeTimeout(_) => true,
+            // Anything that says the transport itself failed. Named
+            // positively rather than by exclusion so a new steam-vent variant
+            // defaults to "charge the match", which is the recoverable
+            // mistake of the two.
+            //
+            // `Ws(_)` covers every websocket error without naming
+            // tungstenite's types here: once a websocket has errored, the
+            // connection is finished whatever the variant said.
+            Self::Network(e) => matches!(
+                **e,
+                NetworkError::Ws(_)
+                    | NetworkError::IO(_)
+                    | NetworkError::EOF
+                    | NetworkError::CryptoHandshakeFailed
+                    | NetworkError::CryptoError(_)
+            ),
+        }
+    }
+}
+
 impl GcTransport {
     /// Connect to the CS2 Game Coordinator.
     ///
@@ -340,5 +385,72 @@ fn parse_fatal_error(raw: RawNetMessage) -> GcTransportError {
                 country: String::new(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod session_fatal_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite;
+
+    /// The live failure. The Steam websocket had closed, so every GC send
+    /// came back with this — and because only `StreamClosed` counted as
+    /// session death, the enricher charged it to each match's retry budget
+    /// in turn and the ingestion queue filled with matches recorded as
+    /// having failed enrichment when nothing had ever been asked of Valve.
+    #[test]
+    fn a_closed_websocket_is_session_death_not_a_bad_match() {
+        let err = GcTransportError::from(NetworkError::Ws(tungstenite::Error::AlreadyClosed));
+
+        assert_eq!(
+            err.to_string(),
+            "Trying to work with closed connection",
+            "the message the operator saw on the pipeline page"
+        );
+        assert!(err.is_session_fatal());
+    }
+
+    #[test]
+    fn other_transport_deaths_are_session_fatal_too() {
+        for err in [
+            GcTransportError::StreamClosed,
+            GcTransportError::HandshakeTimeout(30),
+            GcTransportError::LogonFatalError {
+                error_code: 1,
+                message: "nope".into(),
+                country: "GB".into(),
+            },
+            GcTransportError::from(NetworkError::EOF),
+            GcTransportError::from(NetworkError::Ws(tungstenite::Error::ConnectionClosed)),
+            GcTransportError::from(NetworkError::IO(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            ))),
+            GcTransportError::from(NetworkError::CryptoHandshakeFailed),
+        ] {
+            assert!(err.is_session_fatal(), "{err} should be session-fatal");
+        }
+    }
+
+    /// The other half of the rule: a request that failed on its own merits
+    /// still belongs to the match that provoked it, or a genuinely bad share
+    /// code would retry forever behind an endless reconnect loop.
+    #[test]
+    fn per_request_failures_stay_with_the_match() {
+        for err in [
+            GcTransportError::from(NetworkError::Timeout),
+            GcTransportError::from(NetworkError::InvalidHeader),
+            GcTransportError::from(NetworkError::InvalidMessageKind(7)),
+        ] {
+            assert!(!err.is_session_fatal(), "{err} should not be session-fatal");
+        }
+    }
+
+    #[test]
+    fn the_wrapper_error_forwards_the_classification() {
+        let fatal = crate::Error::Transport(GcTransportError::StreamClosed);
+        let not_fatal = crate::Error::Transport(GcTransportError::from(NetworkError::Timeout));
+
+        assert!(fatal.is_session_fatal());
+        assert!(!not_fatal.is_session_fatal());
     }
 }
