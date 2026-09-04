@@ -478,7 +478,7 @@ impl<'a> BitReader<'a> {
     /// When not byte-aligned (e.g. after a UBitVar that used 10/14/34 bits),
     /// assembles each byte by reading 8 bits across byte boundaries.
     fn read_bytes(&mut self, n: usize) -> Option<Vec<u8>> {
-        if self.bit_pos % 8 == 0 {
+        if self.bit_pos.is_multiple_of(8) {
             // Fast path: byte-aligned, can slice directly
             let byte_pos = self.bit_pos / 8;
             let end = byte_pos.checked_add(n)?;
