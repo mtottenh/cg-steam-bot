@@ -41,8 +41,8 @@ use steam_vent_proto_csgo::cstrike15_gcmessages as pb;
 
 pub use crate::provider::GcProvider;
 // Re-exported so consumers (cs2-enricher) can classify session-fatal
-// transport failures (StreamClosed) and reconnect instead of burning the
-// per-match retry budget on a dead session.
+// transport failures and reconnect instead of burning the per-match retry
+// budget on a dead session — see `Error::is_session_fatal`.
 use crate::transport::GcTransport;
 pub use crate::transport::GcTransportError;
 use crate::types::{MatchInfo, OwnProfile};
@@ -61,6 +61,19 @@ const HELLO_MAX_ATTEMPTS: u32 = 10;
 pub enum Error {
     #[error(transparent)]
     Transport(#[from] GcTransportError),
+}
+
+impl Error {
+    /// Whether the GC session is gone rather than this one request having
+    /// failed. See [`GcTransportError::is_session_fatal`] — the caller should
+    /// reconnect and retry the same work, not charge it to the item it
+    /// happened to be processing.
+    #[must_use]
+    pub fn is_session_fatal(&self) -> bool {
+        match self {
+            Self::Transport(e) => e.is_session_fatal(),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

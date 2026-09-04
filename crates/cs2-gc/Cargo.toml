@@ -17,3 +17,11 @@ protobuf = "3"
 cs2-sharecode = { path = "../cs2-sharecode" }
 cs2-provider = { path = "../cs2-provider" }
 serde.workspace = true
+
+[dev-dependencies]
+# Only to construct the exact websocket error the live failure produced
+# (`AlreadyClosed` → "Trying to work with closed connection") in the
+# classification tests. Pinned to the version steam-vent 0.4 builds against;
+# if it moves, these tests stop compiling rather than quietly testing a
+# different type.
+tokio-tungstenite = "0.27"
